@@ -1,0 +1,25 @@
+# Requirements for extract_connectivity_features.py
+# EEG连接性特征提取所需的Python包
+
+# 核心依赖
+numpy>=1.20.0
+pandas>=1.3.0
+scipy>=1.7.0
+
+# MNE-Python (EEG数据处理)
+mne>=1.0.0
+
+# 统计和机器学习
+scikit-learn>=1.0.0
+statsmodels>=0.13.0
+
+# 图网络分析
+networkx>=2.6.0
+
+# 可视化
+matplotlib>=3.4.0
+seaborn>=0.11.0
+
+# 安装说明:
+# pip install -r connectivity_requirements.txt
+

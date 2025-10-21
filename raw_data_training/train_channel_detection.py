@@ -15,7 +15,11 @@ import json
 from datetime import datetime
 
 from dataset_channel_aware import create_channel_aware_dataloaders
-from model_channel_detection import create_channel_detector, FocalBCELoss
+from model_channel_detection import (
+    create_channel_detector, 
+    FocalBCELoss, 
+    BalancedBCEWithCardinality
+)
 from utils import AverageMeter, save_checkpoint, load_checkpoint, EarlyStopping
 
 
@@ -39,6 +43,11 @@ def compute_channel_metrics(pred_probs, true_mask, threshold=0.5):
     recalls = []
     f1s = []
     
+    # 统计预测分布
+    total_pred_positive = 0
+    total_true_positive = 0
+    total_samples_pred_all_zero = 0
+    
     for i in range(batch_size):
         pred = pred_binary[i]
         true = true_mask[i]
@@ -47,6 +56,14 @@ def compute_channel_metrics(pred_probs, true_mask, threshold=0.5):
         fp = (pred * (1 - true)).sum().item()
         fn = ((1 - pred) * true).sum().item()
         
+        # 检查是否预测全0
+        if pred.sum().item() == 0:
+            total_samples_pred_all_zero += 1
+        
+        total_pred_positive += pred.sum().item()
+        total_true_positive += true.sum().item()
+        
+        # 处理边界情况：如果模型预测全0，precision为0但不是NaN
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
@@ -55,15 +72,37 @@ def compute_channel_metrics(pred_probs, true_mask, threshold=0.5):
         recalls.append(recall)
         f1s.append(f1)
     
-    # 整体准确率
+    # 整体准确率（注意：这个指标在不平衡数据中意义不大）
     accuracy = (pred_binary == true_mask).float().mean().item()
+    
+    # 平均预测的活跃通道数
+    avg_pred_active = total_pred_positive / batch_size
+    avg_true_active = total_true_positive / batch_size
     
     return {
         'accuracy': accuracy * 100,
         'precision': np.mean(precisions) * 100,
         'recall': np.mean(recalls) * 100,
-        'f1': np.mean(f1s) * 100
+        'f1': np.mean(f1s) * 100,
+        'avg_pred_active': avg_pred_active,
+        'avg_true_active': avg_true_active,
+        'samples_pred_all_zero': total_samples_pred_all_zero,
+        'pred_all_zero_rate': total_samples_pred_all_zero / batch_size * 100
     }
+
+
+def check_model_collapse(metrics, threshold=0.8):
+    """
+    检测模型是否退化为预测全0
+    
+    Args:
+        metrics: compute_channel_metrics返回的指标
+        threshold: 如果超过这个比例的样本预测全0，则认为模型崩溃
+    
+    Returns:
+        bool: True表示模型可能崩溃
+    """
+    return metrics['pred_all_zero_rate'] > threshold * 100
 
 
 class ChannelDetectionTrainer:
@@ -107,9 +146,11 @@ class ChannelDetectionTrainer:
         precisions = AverageMeter()
         recalls = AverageMeter()
         f1s = AverageMeter()
+        avg_pred_actives = AverageMeter()
+        avg_true_actives = AverageMeter()
         
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} [Train]")
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             data = batch['data'].to(self.device)
             channel_mask = batch['channel_mask'].to(self.device)
             
@@ -134,11 +175,18 @@ class ChannelDetectionTrainer:
             precisions.update(metrics['precision'], data.size(0))
             recalls.update(metrics['recall'], data.size(0))
             f1s.update(metrics['f1'], data.size(0))
+            avg_pred_actives.update(metrics['avg_pred_active'], data.size(0))
+            avg_true_actives.update(metrics['avg_true_active'], data.size(0))
+            
+            # 检测模型崩溃（预测全0）
+            if batch_idx % 50 == 0 and check_model_collapse(metrics, threshold=0.8):
+                print(f"\n⚠️  警告: {metrics['pred_all_zero_rate']:.1f}% 样本预测全0！模型可能陷入局部最优。")
             
             pbar.set_postfix({
                 'loss': f'{losses.avg:.4f}',
                 'F1': f'{f1s.avg:.2f}%',
-                'Acc': f'{accuracies.avg:.2f}%'
+                'R': f'{recalls.avg:.2f}%',
+                'PredAvg': f'{avg_pred_actives.avg:.1f}'
             })
         
         return {
@@ -146,7 +194,9 @@ class ChannelDetectionTrainer:
             'accuracy': accuracies.avg,
             'precision': precisions.avg,
             'recall': recalls.avg,
-            'f1': f1s.avg
+            'f1': f1s.avg,
+            'avg_pred_active': avg_pred_actives.avg,
+            'avg_true_active': avg_true_actives.avg
         }
     
     def validate(self, epoch, phase='Val'):
@@ -158,6 +208,10 @@ class ChannelDetectionTrainer:
         precisions = AverageMeter()
         recalls = AverageMeter()
         f1s = AverageMeter()
+        avg_pred_actives = AverageMeter()
+        avg_true_actives = AverageMeter()
+        all_zero_count = 0
+        total_count = 0
         
         loader = self.val_loader if phase == 'Val' else self.test_loader
         
@@ -181,19 +235,30 @@ class ChannelDetectionTrainer:
                 precisions.update(metrics['precision'], data.size(0))
                 recalls.update(metrics['recall'], data.size(0))
                 f1s.update(metrics['f1'], data.size(0))
+                avg_pred_actives.update(metrics['avg_pred_active'], data.size(0))
+                avg_true_actives.update(metrics['avg_true_active'], data.size(0))
+                
+                all_zero_count += metrics['samples_pred_all_zero']
+                total_count += data.size(0)
                 
                 pbar.set_postfix({
                     'loss': f'{losses.avg:.4f}',
                     'F1': f'{f1s.avg:.2f}%',
-                    'Acc': f'{accuracies.avg:.2f}%'
+                    'R': f'{recalls.avg:.2f}%',
+                    'PredAvg': f'{avg_pred_actives.avg:.1f}'
                 })
+        
+        pred_all_zero_rate = all_zero_count / total_count * 100 if total_count > 0 else 0
         
         return {
             'loss': losses.avg,
             'accuracy': accuracies.avg,
             'precision': precisions.avg,
             'recall': recalls.avg,
-            'f1': f1s.avg
+            'f1': f1s.avg,
+            'avg_pred_active': avg_pred_actives.avg,
+            'avg_true_active': avg_true_actives.avg,
+            'pred_all_zero_rate': pred_all_zero_rate
         }
     
     def train(self, n_epochs):
@@ -234,13 +299,21 @@ class ChannelDetectionTrainer:
             print(f"\nEpoch {epoch}/{n_epochs}")
             print(f"  Train - Loss: {train_metrics['loss']:.4f}, "
                   f"F1: {train_metrics['f1']:.2f}%, "
-                  f"Acc: {train_metrics['accuracy']:.2f}%")
+                  f"Recall: {train_metrics['recall']:.2f}%")
+            print(f"          PredAvg: {train_metrics['avg_pred_active']:.2f}, "
+                  f"TrueAvg: {train_metrics['avg_true_active']:.2f}")
             print(f"  Val   - Loss: {val_metrics['loss']:.4f}, "
                   f"F1: {val_metrics['f1']:.2f}%, "
-                  f"Acc: {val_metrics['accuracy']:.2f}%")
-            print(f"  Val Precision: {val_metrics['precision']:.2f}%, "
                   f"Recall: {val_metrics['recall']:.2f}%")
+            print(f"          Precision: {val_metrics['precision']:.2f}%, "
+                  f"PredAvg: {val_metrics['avg_pred_active']:.2f}")
+            print(f"          预测全0率: {val_metrics['pred_all_zero_rate']:.1f}%")
             print(f"  LR: {current_lr:.6f}")
+            
+            # 警告：模型可能崩溃
+            if val_metrics['pred_all_zero_rate'] > 50:
+                print(f"  ⚠️  警告: 超过50%的验证样本预测全0，模型可能陷入局部最优！")
+                print(f"      建议: 1) 增加pos_weight, 2) 降低学习率, 3) 检查数据")
             
             # 保存最佳模型（基于F1分数）
             is_best = val_metrics['f1'] > self.best_val_f1
@@ -314,10 +387,17 @@ def main():
     parser.add_argument('--early_stopping_patience', type=int, default=30)
     
     # Loss参数
+    parser.add_argument('--loss_type', type=str, default='focal',
+                        choices=['focal', 'balanced_bce'],
+                        help='损失函数类型: focal或balanced_bce')
     parser.add_argument('--focal_alpha', type=float, default=0.25,
                         help='Focal loss alpha (正样本权重)')
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal loss gamma (难样本权重)')
+    parser.add_argument('--pos_weight', type=float, default=8,
+                        help='正样本权重（用于处理类别不平衡），推荐10-20')
+    parser.add_argument('--cardinality_weight', type=float, default=0.5,
+                        help='基数损失权重（鼓励预测合理数量的活跃通道）')
     
     # 其他
     parser.add_argument('--normalization', type=str, default='window_robust')
@@ -358,14 +438,42 @@ def main():
         normalization=args.normalization
     )
     
-    # 获取数据形状
+    # 获取数据形状和统计信息
     sample_batch = next(iter(train_loader))
     n_channels = sample_batch['data'].shape[1]
     n_samples = sample_batch['data'].shape[2]
     
+    # 统计数据集中的正负样本比例
+    print("\n统计数据集中的活跃通道分布...")
+    total_positive = 0
+    total_negative = 0
+    total_samples = 0
+    active_counts = []
+    
+    for batch in train_loader:
+        channel_mask = batch['channel_mask']
+        total_positive += channel_mask.sum().item()
+        total_negative += (1 - channel_mask).sum().item()
+        total_samples += channel_mask.size(0)
+        active_counts.extend(channel_mask.sum(dim=1).tolist())
+    
+    pos_ratio = total_positive / (total_positive + total_negative)
+    neg_ratio = total_negative / (total_positive + total_negative)
+    avg_active = total_positive / total_samples
+    
+    # 计算推荐的pos_weight（负样本/正样本）
+    recommended_pos_weight = neg_ratio / pos_ratio if pos_ratio > 0 else 10.0
+    
     print(f"\n数据信息:")
     print(f"  数据形状: channels={n_channels}, samples={n_samples}")
     print(f"  任务：从{n_channels}个通道中识别活跃通道（通常2-5个）")
+    print(f"\n数据集统计:")
+    print(f"  总样本数: {total_samples}")
+    print(f"  平均活跃通道数: {avg_active:.2f}")
+    print(f"  活跃通道比例: {pos_ratio*100:.2f}%")
+    print(f"  非活跃通道比例: {neg_ratio*100:.2f}%")
+    print(f"  推荐pos_weight: {recommended_pos_weight:.1f}")
+    print(f"  实际使用pos_weight: {args.pos_weight}")
     
     # 创建模型
     print(f"\n创建活跃通道检测器...")
@@ -379,8 +487,24 @@ def main():
     )
     model = model.to(device)
     
-    # 损失函数（Focal BCE处理类别不平衡）
-    criterion = FocalBCELoss(alpha=args.focal_alpha, gamma=args.focal_gamma)
+    # 损失函数
+    print(f"\n损失函数: {args.loss_type}")
+    if args.loss_type == 'focal':
+        pos_weight_tensor = torch.tensor([args.pos_weight], device=device)
+        criterion = FocalBCELoss(
+            alpha=args.focal_alpha, 
+            gamma=args.focal_gamma,
+            pos_weight=pos_weight_tensor
+        )
+        print(f"  Focal Loss - alpha={args.focal_alpha}, gamma={args.focal_gamma}, pos_weight={args.pos_weight}")
+    else:  # balanced_bce
+        criterion = BalancedBCEWithCardinality(
+            pos_weight=args.pos_weight,
+            cardinality_weight=args.cardinality_weight,
+            expected_active=(2, 5)
+        )
+        print(f"  Balanced BCE - pos_weight={args.pos_weight}, cardinality_weight={args.cardinality_weight}")
+        print(f"  这个loss会严重惩罚漏检（FN），并鼓励预测2-5个活跃通道")
     
     # 优化器
     optimizer = optim.AdamW(

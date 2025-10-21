@@ -1,0 +1,1882 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+extract_connectivity_features.py
+
+对30s窗口的EEG数据提取全面的连接性特征。
+
+特征包括：
+1. 线性相关：Pearson r, Partial correlation
+2. 非参数相关：Spearman rho
+3. 相位同步：PLV, PLI, wPLI, phase-locking angle
+4. 频域相干：Coherence, Imaginary coherence
+5. 包络耦合：Amplitude Envelope Correlation (AEC)
+6. 有向连接：Granger causality, Transfer Entropy
+7. 图网络指标：degree, clustering, betweenness, centrality, modularity
+8. 动态连接：time-resolved connectivity, 状态切换
+9. 统计显著性：permutation test, FDR correction
+
+使用方法:
+    # 处理单个文件
+    python extract_connectivity_features.py --input_file "path/to/file.set"
+    
+    # 批量处理
+    python extract_connectivity_features.py --input_dir "path/to/directory" --pattern "*_merged_*.set"
+"""
+
+import os
+import sys
+import argparse
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import mne
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from scipy import signal, stats
+from scipy.signal import hilbert, butter, filtfilt
+from scipy.stats import spearmanr, zscore
+from sklearn.covariance import GraphicalLassoCV
+import networkx as nx
+from itertools import combinations
+
+# 抑制警告
+warnings.filterwarnings('ignore')
+mne.set_log_level('ERROR')
+
+# 设置绘图样式
+plt.style.use('default')
+sns.set_palette("husl")
+
+
+# ============================================================================
+# 配置参数
+# ============================================================================
+class Config:
+    """全局配置"""
+    # 时间窗口参数
+    WINDOW_SIZE = 30  # 30秒窗口
+    OVERLAP = 0  # 不重叠
+    
+    # 频段定义
+    FREQ_BANDS = {
+        'delta': (0.5, 4),
+        'theta': (4, 8),
+        'alpha': (8, 13),
+        'beta': (13, 30),
+        'gamma': (30, 50)
+    }
+    
+    # 动态连接参数
+    DFC_WINDOW = 2  # 动态连接的短窗口（秒）
+    DFC_STEP = 1  # 动态连接的步长（秒）
+    
+    # 统计参数
+    N_PERMUTATIONS = 500  # 置换检验次数
+    FDR_ALPHA = 0.05  # FDR校正显著性水平
+    
+    # 图网络阈值
+    SPARSITY_THRESHOLD = 0.2  # 保留最强的20%连接
+
+
+# ============================================================================
+# 数据预处理
+# ============================================================================
+def segment_data(raw, window_size=30, overlap=0):
+    """
+    将EEG数据切割成固定大小的窗口
+    
+    参数:
+        raw: MNE Raw对象
+        window_size: 窗口大小（秒）
+        overlap: 重叠大小（秒）
+    
+    返回:
+        segments: list of (data, start_time, end_time)
+    """
+    sfreq = raw.info['sfreq']
+    n_channels = len(raw.ch_names)
+    n_samples = len(raw.times)
+    
+    window_samples = int(window_size * sfreq)
+    step_samples = int((window_size - overlap) * sfreq)
+    
+    segments = []
+    start = 0
+    
+    while start + window_samples <= n_samples:
+        end = start + window_samples
+        
+        # 提取数据段
+        data = raw.get_data(start=start, stop=end)
+        start_time = start / sfreq
+        end_time = end / sfreq
+        
+        segments.append({
+            'data': data,
+            'start_time': start_time,
+            'end_time': end_time,
+            'n_channels': n_channels,
+            'sfreq': sfreq
+        })
+        
+        start += step_samples
+    
+    return segments
+
+
+def bandpass_filter(data, sfreq, lowcut, highcut, order=4):
+    """带通滤波"""
+    nyq = 0.5 * sfreq
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    return filtfilt(b, a, data, axis=1)
+
+
+# ============================================================================
+# 1. 线性相关
+# ============================================================================
+def compute_pearson_correlation(data):
+    """
+    计算Pearson相关系数矩阵
+    
+    参数:
+        data: (n_channels, n_samples)
+    
+    返回:
+        corr_matrix: (n_channels, n_channels)
+    """
+    corr_matrix = np.corrcoef(data)
+    return corr_matrix
+
+
+def compute_partial_correlation(data):
+    """
+    计算偏相关矩阵（控制其他所有通道）
+    使用精度矩阵（precision matrix）方法
+    
+    参数:
+        data: (n_channels, n_samples)
+    
+    返回:
+        partial_corr: (n_channels, n_channels)
+    """
+    n_channels = data.shape[0]
+    
+    try:
+        # 使用GraphicalLasso估计精度矩阵
+        model = GraphicalLassoCV(cv=3, max_iter=100)
+        model.fit(data.T)
+        precision = model.precision_
+        
+        # 从精度矩阵计算偏相关
+        partial_corr = np.zeros((n_channels, n_channels))
+        for i in range(n_channels):
+            for j in range(n_channels):
+                if i != j:
+                    partial_corr[i, j] = -precision[i, j] / np.sqrt(precision[i, i] * precision[j, j])
+        
+        # 对角线设为1
+        np.fill_diagonal(partial_corr, 1.0)
+        
+    except Exception as e:
+        print(f"  Warning: Partial correlation failed, using simple method: {e}")
+        # 简单方法：使用相关矩阵的逆
+        corr = np.corrcoef(data)
+        try:
+            inv_corr = np.linalg.pinv(corr)
+            partial_corr = np.zeros((n_channels, n_channels))
+            for i in range(n_channels):
+                for j in range(n_channels):
+                    if i != j:
+                        partial_corr[i, j] = -inv_corr[i, j] / np.sqrt(inv_corr[i, i] * inv_corr[j, j])
+            np.fill_diagonal(partial_corr, 1.0)
+        except:
+            partial_corr = corr.copy()
+    
+    return partial_corr
+
+
+# ============================================================================
+# 2. 非参数相关
+# ============================================================================
+def compute_spearman_correlation(data):
+    """
+    计算Spearman秩相关矩阵
+    
+    参数:
+        data: (n_channels, n_samples)
+    
+    返回:
+        spearman_matrix: (n_channels, n_channels)
+    """
+    n_channels = data.shape[0]
+    spearman_matrix = np.zeros((n_channels, n_channels))
+    
+    for i in range(n_channels):
+        for j in range(i, n_channels):
+            rho, _ = spearmanr(data[i], data[j])
+            spearman_matrix[i, j] = rho
+            spearman_matrix[j, i] = rho
+    
+    return spearman_matrix
+
+
+# ============================================================================
+# 3. 相位同步
+# ============================================================================
+def compute_phase_locking_value(data, sfreq, fmin, fmax):
+    """
+    计算相位锁定值 (PLV)
+    
+    参数:
+        data: (n_channels, n_samples)
+        sfreq: 采样率
+        fmin, fmax: 频率范围
+    
+    返回:
+        plv_matrix: (n_channels, n_channels)
+    """
+    # 带通滤波
+    filtered_data = bandpass_filter(data, sfreq, fmin, fmax)
+    
+    # Hilbert变换提取相位
+    analytic_signal = hilbert(filtered_data, axis=1)
+    phase = np.angle(analytic_signal)
+    
+    n_channels = data.shape[0]
+    plv_matrix = np.zeros((n_channels, n_channels))
+    
+    for i in range(n_channels):
+        for j in range(i+1, n_channels):
+            # 相位差
+            phase_diff = phase[i] - phase[j]
+            # PLV = |<e^(i*phase_diff)>|
+            plv = np.abs(np.mean(np.exp(1j * phase_diff)))
+            plv_matrix[i, j] = plv
+            plv_matrix[j, i] = plv
+    
+    np.fill_diagonal(plv_matrix, 1.0)
+    return plv_matrix
+
+
+def compute_phase_lag_index(data, sfreq, fmin, fmax):
+    """
+    计算相位延迟指数 (PLI)
+    PLI 减弱体积传导影响
+    
+    参数:
+        data: (n_channels, n_samples)
+        sfreq: 采样率
+        fmin, fmax: 频率范围
+    
+    返回:
+        pli_matrix: (n_channels, n_channels)
+    """
+    # 带通滤波
+    filtered_data = bandpass_filter(data, sfreq, fmin, fmax)
+    
+    # Hilbert变换提取相位
+    analytic_signal = hilbert(filtered_data, axis=1)
+    phase = np.angle(analytic_signal)
+    
+    n_channels = data.shape[0]
+    pli_matrix = np.zeros((n_channels, n_channels))
+    
+    for i in range(n_channels):
+        for j in range(i+1, n_channels):
+            # 相位差
+            phase_diff = phase[i] - phase[j]
+            # PLI = |<sign(phase_diff)>|
+            pli = np.abs(np.mean(np.sign(phase_diff)))
+            pli_matrix[i, j] = pli
+            pli_matrix[j, i] = pli
+    
+    np.fill_diagonal(pli_matrix, 1.0)
+    return pli_matrix
+
+
+def compute_weighted_pli(data, sfreq, fmin, fmax):
+    """
+    计算加权PLI (wPLI)
+    进一步减弱体积传导影响
+    
+    参数:
+        data: (n_channels, n_samples)
+        sfreq: 采样率
+        fmin, fmax: 频率范围
+    
+    返回:
+        wpli_matrix: (n_channels, n_channels)
+    """
+    # 带通滤波
+    filtered_data = bandpass_filter(data, sfreq, fmin, fmax)
+    
+    # Hilbert变换提取相位
+    analytic_signal = hilbert(filtered_data, axis=1)
+    phase = np.angle(analytic_signal)
+    
+    n_channels = data.shape[0]
+    wpli_matrix = np.zeros((n_channels, n_channels))
+    
+    for i in range(n_channels):
+        for j in range(i+1, n_channels):
+            # 相位差的虚部
+            phase_diff = phase[i] - phase[j]
+            imag_phase = np.sin(phase_diff)
+            
+            # wPLI = |<|imag_phase|>| / <|imag_phase|>
+            numerator = np.abs(np.mean(imag_phase))
+            denominator = np.mean(np.abs(imag_phase))
+            
+            if denominator > 0:
+                wpli = numerator / denominator
+            else:
+                wpli = 0
+            
+            wpli_matrix[i, j] = wpli
+            wpli_matrix[j, i] = wpli
+    
+    np.fill_diagonal(wpli_matrix, 1.0)
+    return wpli_matrix
+
+
+def compute_phase_locking_angle(data, sfreq, fmin, fmax):
+    """
+    计算平均相位差（phase-locking angle）
+    
+    参数:
+        data: (n_channels, n_samples)
+        sfreq: 采样率
+        fmin, fmax: 频率范围
+    
+    返回:
+        angle_matrix: (n_channels, n_channels) 单位：弧度
+    """
+    # 带通滤波
+    filtered_data = bandpass_filter(data, sfreq, fmin, fmax)
+    
+    # Hilbert变换提取相位
+    analytic_signal = hilbert(filtered_data, axis=1)
+    phase = np.angle(analytic_signal)
+    
+    n_channels = data.shape[0]
+    angle_matrix = np.zeros((n_channels, n_channels))
+    
+    for i in range(n_channels):
+        for j in range(i+1, n_channels):
+            # 平均相位差
+            phase_diff = phase[i] - phase[j]
+            mean_angle = np.angle(np.mean(np.exp(1j * phase_diff)))
+            
+            angle_matrix[i, j] = mean_angle
+            angle_matrix[j, i] = -mean_angle  # 对称
+    
+    return angle_matrix
+
+
+# ============================================================================
+# 4. 频域相干
+# ============================================================================
+def compute_coherence(data, sfreq, fmin, fmax):
+    """
+    计算相干性 (Coherence)
+    
+    参数:
+        data: (n_channels, n_samples)
+        sfreq: 采样率
+        fmin, fmax: 频率范围
+    
+    返回:
+        coherence_matrix: (n_channels, n_channels)
+    """
+    n_channels = data.shape[0]
+    coherence_matrix = np.zeros((n_channels, n_channels))
+    
+    for i in range(n_channels):
+        for j in range(i, n_channels):
+            # 计算相干性
+            f, Cxy = signal.coherence(data[i], data[j], sfreq, nperseg=min(256, data.shape[1]//4))
+            
+            # 选择频段内的相干性
+            freq_mask = (f >= fmin) & (f <= fmax)
+            mean_coh = np.mean(Cxy[freq_mask])
+            
+            coherence_matrix[i, j] = mean_coh
+            coherence_matrix[j, i] = mean_coh
+    
+    np.fill_diagonal(coherence_matrix, 1.0)
+    return coherence_matrix
+
+
+def compute_imaginary_coherence(data, sfreq, fmin, fmax):
+    """
+    计算虚相干 (Imaginary Coherence)
+    能抑制零相位耦合假象
+    
+    参数:
+        data: (n_channels, n_samples)
+        sfreq: 采样率
+        fmin, fmax: 频率范围
+    
+    返回:
+        icoh_matrix: (n_channels, n_channels)
+    """
+    n_channels = data.shape[0]
+    n_samples = data.shape[1]
+    icoh_matrix = np.zeros((n_channels, n_channels))
+    
+    nperseg = min(256, n_samples // 4)
+    
+    for i in range(n_channels):
+        for j in range(i+1, n_channels):
+            # 计算交叉功率谱密度
+            f, Pxy = signal.csd(data[i], data[j], sfreq, nperseg=nperseg)
+            
+            # 计算自功率谱密度
+            _, Pxx = signal.welch(data[i], sfreq, nperseg=nperseg)
+            _, Pyy = signal.welch(data[j], sfreq, nperseg=nperseg)
+            
+            # 选择频段
+            freq_mask = (f >= fmin) & (f <= fmax)
+            
+            # 提取频段内的值
+            cross_spectrum = Pxy[freq_mask]
+            auto_i = Pxx[freq_mask]
+            auto_j = Pyy[freq_mask]
+            
+            # 虚相干 = |Im(cross_spectrum)| / sqrt(auto_i * auto_j)
+            imag_part = np.abs(np.imag(cross_spectrum))
+            denominator = np.sqrt(auto_i * auto_j)
+            
+            # 避免除零
+            mask = denominator > 0
+            icoh = np.zeros_like(imag_part)
+            icoh[mask] = imag_part[mask] / denominator[mask]
+            
+            mean_icoh = np.mean(icoh)
+            icoh_matrix[i, j] = mean_icoh
+            icoh_matrix[j, i] = mean_icoh
+    
+    np.fill_diagonal(icoh_matrix, 1.0)
+    return icoh_matrix
+
+
+# ============================================================================
+# 5. 包络耦合
+# ============================================================================
+def compute_amplitude_envelope_correlation(data, sfreq, fmin, fmax):
+    """
+    计算振幅包络相关 (AEC)
+    步骤：bandpass → Hilbert → 包络 → Pearson
+    
+    参数:
+        data: (n_channels, n_samples)
+        sfreq: 采样率
+        fmin, fmax: 频率范围
+    
+    返回:
+        aec_matrix: (n_channels, n_channels)
+    """
+    # 带通滤波
+    filtered_data = bandpass_filter(data, sfreq, fmin, fmax)
+    
+    # Hilbert变换提取包络
+    analytic_signal = hilbert(filtered_data, axis=1)
+    envelope = np.abs(analytic_signal)
+    
+    # 对包络进行低通滤波（去除快速波动）
+    # 使用0.5Hz低通滤波
+    if sfreq > 2:
+        envelope = bandpass_filter(envelope, sfreq, 0.1, min(0.5, sfreq/4))
+    
+    # 计算包络间的Pearson相关
+    aec_matrix = np.corrcoef(envelope)
+    
+    return aec_matrix
+
+
+# ============================================================================
+# 6. 有向/有效连接
+# ============================================================================
+def compute_granger_causality_pairwise(data, sfreq, max_lag=None):
+    """
+    计算成对Granger因果性（时域）
+    简化版本：使用向量自回归模型
+    
+    参数:
+        data: (n_channels, n_samples)
+        sfreq: 采样率
+        max_lag: 最大滞后阶数，默认为采样率的1/10
+    
+    返回:
+        gc_matrix: (n_channels, n_channels) i→j的因果性
+    """
+    from statsmodels.tsa.stattools import grangercausalitytests
+    
+    n_channels = data.shape[0]
+    gc_matrix = np.zeros((n_channels, n_channels))
+    
+    if max_lag is None:
+        max_lag = int(sfreq / 10)  # 默认100ms
+    
+    max_lag = max(1, min(max_lag, 20))  # 限制在1-20之间
+    
+    for i in range(n_channels):
+        for j in range(n_channels):
+            if i == j:
+                continue
+            
+            try:
+                # 构建数据：[target, source]
+                test_data = np.column_stack([data[j], data[i]])
+                
+                # Granger因果性检验
+                result = grangercausalitytests(test_data, maxlag=max_lag, verbose=False)
+                
+                # 提取F统计量（平均）
+                f_values = [result[lag][0]['ssr_ftest'][0] for lag in range(1, max_lag+1)]
+                gc_matrix[i, j] = np.mean(f_values)
+                
+            except Exception as e:
+                gc_matrix[i, j] = 0
+    
+    return gc_matrix
+
+
+def compute_transfer_entropy_pairwise(data, n_bins=10, lag=1):
+    """
+    计算传递熵 (Transfer Entropy)
+    捕获非线性信息流
+    
+    参数:
+        data: (n_channels, n_samples)
+        n_bins: 离散化的bins数量
+        lag: 时间延迟
+    
+    返回:
+        te_matrix: (n_channels, n_channels) i→j的传递熵
+    """
+    n_channels, n_samples = data.shape
+    te_matrix = np.zeros((n_channels, n_channels))
+    
+    # 对数据进行标准化和离散化
+    data_normalized = zscore(data, axis=1)
+    
+    for i in range(n_channels):
+        for j in range(n_channels):
+            if i == j:
+                continue
+            
+            try:
+                # X = source, Y = target
+                X = data_normalized[i]
+                Y = data_normalized[j]
+                
+                # 离散化
+                X_bins = np.digitize(X, bins=np.linspace(X.min(), X.max(), n_bins))
+                Y_bins = np.digitize(Y, bins=np.linspace(Y.min(), Y.max(), n_bins))
+                
+                # 构建时间序列
+                Y_present = Y_bins[lag:]
+                Y_past = Y_bins[:-lag]
+                X_past = X_bins[:-lag]
+                
+                # 计算传递熵: TE(X→Y) = I(Y_present; X_past | Y_past)
+                te = calculate_conditional_mutual_information(Y_present, X_past, Y_past, n_bins)
+                te_matrix[i, j] = max(0, te)  # TE应为非负
+                
+            except Exception as e:
+                te_matrix[i, j] = 0
+    
+    return te_matrix
+
+
+def calculate_conditional_mutual_information(X, Y, Z, n_bins):
+    """
+    计算条件互信息 I(X;Y|Z)
+    """
+    try:
+        # 计算联合概率分布
+        XYZ = np.column_stack([X, Y, Z])
+        
+        # 简化方法：使用熵估计
+        H_XYZ = calculate_entropy_discrete(XYZ, n_bins**3)
+        H_XZ = calculate_entropy_discrete(np.column_stack([X, Z]), n_bins**2)
+        H_YZ = calculate_entropy_discrete(np.column_stack([Y, Z]), n_bins**2)
+        H_Z = calculate_entropy_discrete(Z.reshape(-1, 1), n_bins)
+        
+        # I(X;Y|Z) = H(X,Z) + H(Y,Z) - H(X,Y,Z) - H(Z)
+        cmi = H_XZ + H_YZ - H_XYZ - H_Z
+        
+        return cmi
+    except:
+        return 0
+
+
+def calculate_entropy_discrete(data, n_bins):
+    """计算离散数据的熵"""
+    hist, _ = np.histogramdd(data, bins=n_bins)
+    prob = hist / np.sum(hist)
+    prob = prob[prob > 0]  # 去除零概率
+    entropy = -np.sum(prob * np.log2(prob))
+    return entropy
+
+
+# ============================================================================
+# 7. 图网络指标
+# ============================================================================
+def compute_graph_metrics(connectivity_matrix, threshold=None, sparsity=0.2):
+    """
+    从连接矩阵计算图网络指标
+    
+    参数:
+        connectivity_matrix: (n_channels, n_channels) 连接矩阵
+        threshold: 阈值，低于此值的连接设为0
+        sparsity: 稀疏度，保留最强连接的比例
+    
+    返回:
+        metrics: dict 包含各种图指标
+            - 全局指标（标量）：degree_mean, clustering_mean等
+            - 节点级别指标（向量）：node_degree, node_clustering等
+    """
+    n_nodes = connectivity_matrix.shape[0]
+    
+    # 去除对角线
+    conn = connectivity_matrix.copy()
+    np.fill_diagonal(conn, 0)
+    
+    # 取绝对值（无向图）
+    conn = np.abs(conn)
+    
+    # 阈值化或稀疏化
+    if threshold is not None:
+        conn[conn < threshold] = 0
+    else:
+        # 使用稀疏度阈值
+        flat_conn = conn.flatten()
+        threshold_value = np.percentile(flat_conn, (1 - sparsity) * 100)
+        conn[conn < threshold_value] = 0
+    
+    # 创建NetworkX图
+    G = nx.from_numpy_array(conn)
+    
+    # 计算各种图指标
+    metrics = {}
+    
+    try:
+        # 1. Degree and Strength (节点级别 + 全局统计)
+        degrees = dict(G.degree())
+        strengths = dict(G.degree(weight='weight'))
+        
+        # 节点级别指标（保存为数组）
+        metrics['node_degree'] = np.array([degrees[i] for i in range(n_nodes)])
+        metrics['node_strength'] = np.array([strengths[i] for i in range(n_nodes)])
+        
+        # 全局统计
+        metrics['degree_mean'] = np.mean(list(degrees.values()))
+        metrics['degree_std'] = np.std(list(degrees.values()))
+        metrics['strength_mean'] = np.mean(list(strengths.values()))
+        metrics['strength_std'] = np.std(list(strengths.values()))
+        
+        # 2. Clustering Coefficient (节点级别 + 全局统计)
+        clustering = nx.clustering(G, weight='weight')
+        metrics['node_clustering'] = np.array([clustering[i] for i in range(n_nodes)])
+        metrics['clustering_mean'] = np.mean(list(clustering.values()))
+        metrics['clustering_std'] = np.std(list(clustering.values()))
+        
+        # 3. Betweenness Centrality (节点级别 + 全局统计)
+        if G.number_of_edges() > 0:
+            betweenness = nx.betweenness_centrality(G, weight='weight')
+            metrics['node_betweenness'] = np.array([betweenness[i] for i in range(n_nodes)])
+            metrics['betweenness_mean'] = np.mean(list(betweenness.values()))
+            metrics['betweenness_std'] = np.std(list(betweenness.values()))
+        else:
+            metrics['node_betweenness'] = np.zeros(n_nodes)
+            metrics['betweenness_mean'] = 0
+            metrics['betweenness_std'] = 0
+        
+        # 4. Eigenvector Centrality (节点级别 + 全局统计)
+        try:
+            eigenvector = nx.eigenvector_centrality(G, weight='weight', max_iter=1000)
+            metrics['node_eigenvector'] = np.array([eigenvector[i] for i in range(n_nodes)])
+            metrics['eigenvector_mean'] = np.mean(list(eigenvector.values()))
+            metrics['eigenvector_std'] = np.std(list(eigenvector.values()))
+        except:
+            metrics['node_eigenvector'] = np.zeros(n_nodes)
+            metrics['eigenvector_mean'] = 0
+            metrics['eigenvector_std'] = 0
+        
+        # 5. Modularity (需要先检测社区)
+        try:
+            communities = nx.community.greedy_modularity_communities(G, weight='weight')
+            modularity = nx.community.modularity(G, communities, weight='weight')
+            metrics['modularity'] = modularity
+            metrics['n_communities'] = len(communities)
+            
+            # 节点的社区归属（每个节点属于哪个社区）
+            node_community = np.zeros(n_nodes, dtype=int)
+            for comm_id, comm in enumerate(communities):
+                for node in comm:
+                    node_community[node] = comm_id
+            metrics['node_community'] = node_community
+        except:
+            metrics['modularity'] = 0
+            metrics['n_communities'] = 0
+            metrics['node_community'] = np.zeros(n_nodes, dtype=int)
+        
+        # 6. Global Efficiency
+        try:
+            if G.number_of_edges() > 0:
+                efficiency = nx.global_efficiency(G)
+                metrics['global_efficiency'] = efficiency
+            else:
+                metrics['global_efficiency'] = 0
+        except:
+            metrics['global_efficiency'] = 0
+        
+        # 7. Small-world metrics (如果图连通)
+        try:
+            if nx.is_connected(G):
+                avg_path_length = nx.average_shortest_path_length(G, weight='weight')
+                metrics['avg_path_length'] = avg_path_length
+            else:
+                # 对于非连通图，计算最大连通分量
+                largest_cc = max(nx.connected_components(G), key=len)
+                subG = G.subgraph(largest_cc)
+                if len(largest_cc) > 1:
+                    avg_path_length = nx.average_shortest_path_length(subG, weight='weight')
+                    metrics['avg_path_length'] = avg_path_length
+                else:
+                    metrics['avg_path_length'] = 0
+        except:
+            metrics['avg_path_length'] = 0
+        
+        # 8. Hub nodes (k-core)
+        try:
+            k_core = nx.core_number(G)
+            metrics['max_k_core'] = max(k_core.values()) if k_core else 0
+            metrics['mean_k_core'] = np.mean(list(k_core.values())) if k_core else 0
+        except:
+            metrics['max_k_core'] = 0
+            metrics['mean_k_core'] = 0
+        
+    except Exception as e:
+        print(f"  Warning: Graph metrics computation failed: {e}")
+        # 返回默认值
+        for key in ['degree_mean', 'degree_std', 'strength_mean', 'strength_std',
+                    'clustering_mean', 'clustering_std', 'betweenness_mean', 'betweenness_std',
+                    'eigenvector_mean', 'eigenvector_std', 'modularity', 'n_communities',
+                    'global_efficiency', 'avg_path_length', 'max_k_core', 'mean_k_core']:
+            if key not in metrics:
+                metrics[key] = 0
+    
+    return metrics
+
+
+# ============================================================================
+# 8. 动态连接指标
+# ============================================================================
+def compute_dynamic_connectivity(data, sfreq, method='plv', window_size=2, step=1, fmin=8, fmax=13):
+    """
+    计算时间分辨的动态连接性
+    
+    参数:
+        data: (n_channels, n_samples)
+        sfreq: 采样率
+        method: 连接性方法 ('plv', 'coherence', 'correlation')
+        window_size: 短窗口大小（秒）
+        step: 滑动步长（秒）
+        fmin, fmax: 频率范围
+    
+    返回:
+        dfc_metrics: dict 包含动态连接指标
+    """
+    n_channels, n_samples = data.shape
+    window_samples = int(window_size * sfreq)
+    step_samples = int(step * sfreq)
+    
+    # 滑动窗口
+    connectivity_series = []
+    time_points = []
+    
+    start = 0
+    while start + window_samples <= n_samples:
+        end = start + window_samples
+        segment = data[:, start:end]
+        
+        # 计算连接性
+        if method == 'plv':
+            conn_matrix = compute_phase_locking_value(segment, sfreq, fmin, fmax)
+        elif method == 'coherence':
+            conn_matrix = compute_coherence(segment, sfreq, fmin, fmax)
+        elif method == 'correlation':
+            conn_matrix = compute_pearson_correlation(segment)
+        else:
+            conn_matrix = compute_pearson_correlation(segment)
+        
+        connectivity_series.append(conn_matrix)
+        time_points.append((start + end) / 2 / sfreq)
+        
+        start += step_samples
+    
+    if len(connectivity_series) < 2:
+        # 窗口不足，返回默认值
+        return {
+            'dfc_variance': 0,
+            'dfc_mean': 0,
+            'state_switches': 0,
+            'dwell_time_mean': 0
+        }
+    
+    connectivity_series = np.array(connectivity_series)  # (n_windows, n_channels, n_channels)
+    
+    # 提取上三角（去除对角线）
+    triu_indices = np.triu_indices(n_channels, k=1)
+    connectivity_time_series = connectivity_series[:, triu_indices[0], triu_indices[1]]  # (n_windows, n_pairs)
+    
+    # 1. 连接波动幅度（方差）
+    dfc_variance = np.mean(np.var(connectivity_time_series, axis=0))
+    
+    # 2. 平均连接强度
+    dfc_mean = np.mean(connectivity_time_series)
+    
+    # 3. 状态切换（使用k-means聚类识别状态）
+    from sklearn.cluster import KMeans
+    
+    try:
+        n_states = min(3, len(connectivity_series) - 1)  # 最多3个状态
+        if n_states >= 2:
+            kmeans = KMeans(n_clusters=n_states, random_state=42, n_init=10)
+            states = kmeans.fit_predict(connectivity_time_series)
+            
+            # 计算状态切换次数
+            state_switches = np.sum(np.diff(states) != 0)
+            
+            # 计算平均停留时间
+            state_changes = np.where(np.diff(states) != 0)[0]
+            if len(state_changes) > 0:
+                dwell_times = np.diff(np.concatenate([[0], state_changes, [len(states)]]))
+                dwell_time_mean = np.mean(dwell_times) * step  # 转换为秒
+            else:
+                dwell_time_mean = len(states) * step
+        else:
+            state_switches = 0
+            dwell_time_mean = len(connectivity_series) * step
+    except:
+        state_switches = 0
+        dwell_time_mean = 0
+    
+    dfc_metrics = {
+        'dfc_variance': float(dfc_variance),
+        'dfc_mean': float(dfc_mean),
+        'state_switches': int(state_switches),
+        'dwell_time_mean': float(dwell_time_mean)
+    }
+    
+    return dfc_metrics
+
+
+# ============================================================================
+# 9. 统计显著性检验
+# ============================================================================
+def permutation_test_connectivity(data, sfreq, method='pearson', n_permutations=500, fmin=8, fmax=13):
+    """
+    对连接性矩阵进行置换检验
+    
+    参数:
+        data: (n_channels, n_samples)
+        sfreq: 采样率
+        method: 连接性方法
+        n_permutations: 置换次数
+        fmin, fmax: 频率范围（用于频域方法）
+    
+    返回:
+        p_values: (n_channels, n_channels) p值矩阵
+    """
+    n_channels = data.shape[0]
+    
+    # 计算真实连接性
+    if method == 'pearson':
+        true_conn = compute_pearson_correlation(data)
+    elif method == 'plv':
+        true_conn = compute_phase_locking_value(data, sfreq, fmin, fmax)
+    elif method == 'coherence':
+        true_conn = compute_coherence(data, sfreq, fmin, fmax)
+    else:
+        true_conn = compute_pearson_correlation(data)
+    
+    # 生成置换分布（相位置换）
+    null_distribution = np.zeros((n_permutations, n_channels, n_channels))
+    
+    for perm in range(n_permutations):
+        # 相位置换：对每个通道的相位进行随机旋转
+        permuted_data = phase_shuffle(data)
+        
+        # 计算置换后的连接性
+        if method == 'pearson':
+            null_conn = compute_pearson_correlation(permuted_data)
+        elif method == 'plv':
+            null_conn = compute_phase_locking_value(permuted_data, sfreq, fmin, fmax)
+        elif method == 'coherence':
+            null_conn = compute_coherence(permuted_data, sfreq, fmin, fmax)
+        else:
+            null_conn = compute_pearson_correlation(permuted_data)
+        
+        null_distribution[perm] = null_conn
+    
+    # 计算p值
+    p_values = np.zeros((n_channels, n_channels))
+    for i in range(n_channels):
+        for j in range(n_channels):
+            # p = (number of permutations >= true value) / n_permutations
+            p_values[i, j] = np.sum(null_distribution[:, i, j] >= true_conn[i, j]) / n_permutations
+    
+    return p_values, true_conn
+
+
+def phase_shuffle(data):
+    """
+    相位置换：保持功率谱不变，随机化相位
+    """
+    n_channels, n_samples = data.shape
+    shuffled_data = np.zeros_like(data)
+    
+    for ch in range(n_channels):
+        # FFT
+        fft_data = np.fft.fft(data[ch])
+        
+        # 随机相位
+        magnitude = np.abs(fft_data)
+        random_phase = np.random.uniform(-np.pi, np.pi, n_samples)
+        
+        # 确保对称性（保持实数信号）
+        random_phase[0] = 0
+        if n_samples % 2 == 0:
+            random_phase[n_samples // 2] = 0
+        random_phase[n_samples // 2 + 1:] = -random_phase[1:n_samples // 2][::-1]
+        
+        # 重构信号
+        shuffled_fft = magnitude * np.exp(1j * random_phase)
+        shuffled_data[ch] = np.real(np.fft.ifft(shuffled_fft))
+    
+    return shuffled_data
+
+
+def fdr_correction(p_values, alpha=0.05):
+    """
+    FDR (False Discovery Rate) 校正
+    Benjamini-Hochberg方法
+    
+    参数:
+        p_values: (n_channels, n_channels) p值矩阵
+        alpha: 显著性水平
+    
+    返回:
+        significant_mask: (n_channels, n_channels) 显著性掩码
+    """
+    # 提取上三角（去除对角线）
+    n_channels = p_values.shape[0]
+    triu_indices = np.triu_indices(n_channels, k=1)
+    p_flat = p_values[triu_indices]
+    
+    # 排序
+    sorted_indices = np.argsort(p_flat)
+    sorted_p = p_flat[sorted_indices]
+    
+    # BH方法
+    m = len(sorted_p)
+    threshold_line = alpha * np.arange(1, m + 1) / m
+    
+    # 找到最大满足条件的索引
+    below_line = sorted_p <= threshold_line
+    if np.any(below_line):
+        max_idx = np.where(below_line)[0][-1]
+        threshold = sorted_p[max_idx]
+    else:
+        threshold = 0
+    
+    # 创建显著性掩码
+    significant_mask = np.zeros((n_channels, n_channels), dtype=bool)
+    significant_flat = p_flat <= threshold
+    significant_mask[triu_indices] = significant_flat
+    significant_mask = significant_mask | significant_mask.T  # 对称
+    
+    return significant_mask
+
+
+# ============================================================================
+# 主特征提取函数
+# ============================================================================
+def extract_all_features(segment, config=Config()):
+    """
+    提取单个30s窗口的所有连接性特征
+    
+    参数:
+        segment: dict 包含 'data', 'sfreq', 'start_time', 'end_time'
+        config: 配置对象
+    
+    返回:
+        features: dict 所有特征
+    """
+    data = segment['data']
+    sfreq = segment['sfreq']
+    start_time = segment['start_time']
+    end_time = segment['end_time']
+    n_channels = segment['n_channels']
+    
+    features = {
+        'start_time': start_time,
+        'end_time': end_time,
+        'duration': end_time - start_time,
+        'n_channels': n_channels
+    }
+    
+    print(f"    Extracting features for segment {start_time:.1f}s - {end_time:.1f}s")
+    
+    # 1. 线性相关
+    print("      - Linear correlation...")
+    features['pearson_corr'] = compute_pearson_correlation(data)
+    features['partial_corr'] = compute_partial_correlation(data)
+    
+    # 2. 非参数相关
+    print("      - Spearman correlation...")
+    features['spearman_corr'] = compute_spearman_correlation(data)
+    
+    # 3. 相位同步（对每个频段）
+    print("      - Phase synchrony...")
+    for band_name, (fmin, fmax) in config.FREQ_BANDS.items():
+        features[f'plv_{band_name}'] = compute_phase_locking_value(data, sfreq, fmin, fmax)
+        features[f'pli_{band_name}'] = compute_phase_lag_index(data, sfreq, fmin, fmax)
+        features[f'wpli_{band_name}'] = compute_weighted_pli(data, sfreq, fmin, fmax)
+        features[f'phase_angle_{band_name}'] = compute_phase_locking_angle(data, sfreq, fmin, fmax)
+    
+    # 4. 频域相干（对每个频段）
+    print("      - Coherence...")
+    for band_name, (fmin, fmax) in config.FREQ_BANDS.items():
+        features[f'coherence_{band_name}'] = compute_coherence(data, sfreq, fmin, fmax)
+        features[f'icoh_{band_name}'] = compute_imaginary_coherence(data, sfreq, fmin, fmax)
+    
+    # 5. 包络耦合（对低频段）
+    print("      - Amplitude envelope correlation...")
+    for band_name, (fmin, fmax) in config.FREQ_BANDS.items():
+        if band_name in ['delta', 'theta', 'alpha']:  # 只对低频计算
+            features[f'aec_{band_name}'] = compute_amplitude_envelope_correlation(data, sfreq, fmin, fmax)
+    
+    # 6. 有向连接（计算量大，可选）
+    print("      - Directed connectivity...")
+    if n_channels <= 22 and data.shape[1] >= sfreq * 5:  # 只对小规模和足够长的数据计算
+        try:
+            features['granger_causality'] = compute_granger_causality_pairwise(data, sfreq)
+        except Exception as e:
+            print(f"        Warning: Granger causality failed: {e}")
+            features['granger_causality'] = np.zeros((n_channels, n_channels))
+        
+        try:
+            features['transfer_entropy'] = compute_transfer_entropy_pairwise(data)
+        except Exception as e:
+            print(f"        Warning: Transfer entropy failed: {e}")
+            features['transfer_entropy'] = np.zeros((n_channels, n_channels))
+    else:
+        features['granger_causality'] = np.zeros((n_channels, n_channels))
+        features['transfer_entropy'] = np.zeros((n_channels, n_channels))
+    
+    # 7. 图网络指标（基于多种连接性矩阵）
+    print("      - Graph metrics...")
+    for conn_name in ['pearson_corr', 'spearman_corr', 'plv_alpha', 'coherence_alpha']:
+        if conn_name in features:
+            try:
+                graph_metrics = compute_graph_metrics(
+                    features[conn_name], 
+                    sparsity=config.SPARSITY_THRESHOLD
+                )
+                # 分离标量指标和向量/矩阵指标
+                for metric_name, value in graph_metrics.items():
+                    # 节点级别的指标（数组）会被保存到npz
+                    # 全局统计指标（标量）会被保存到csv
+                    features[f'{conn_name}_graph_{metric_name}'] = value
+            except Exception as e:
+                print(f"        Warning: Graph metrics for {conn_name} failed: {e}")
+    
+    # 8. 动态连接指标（如果数据足够长）
+    print("      - Dynamic connectivity...")
+    if data.shape[1] >= sfreq * 10:  # 至少10秒数据
+        try:
+            dfc_metrics = compute_dynamic_connectivity(
+                data, sfreq, 
+                method='plv',
+                window_size=config.DFC_WINDOW,
+                step=config.DFC_STEP,
+                fmin=8, fmax=13  # alpha频段
+            )
+            for metric_name, value in dfc_metrics.items():
+                features[f'dfc_{metric_name}'] = value
+        except Exception as e:
+            print(f"        Warning: Dynamic connectivity failed: {e}")
+    
+    # 9. 统计显著性（可选，计算量大）
+    # 由于计算量大，这里默认不进行，如需要可以取消注释
+    # print("      - Statistical significance...")
+    # try:
+    #     p_values, _ = permutation_test_connectivity(
+    #         data, sfreq, 
+    #         method='pearson',
+    #         n_permutations=config.N_PERMUTATIONS
+    #     )
+    #     significant_mask = fdr_correction(p_values, alpha=config.FDR_ALPHA)
+    #     features['pearson_significant'] = significant_mask
+    #     features['pearson_pvalues'] = p_values
+    # except Exception as e:
+    #     print(f"        Warning: Statistical test failed: {e}")
+    
+    return features
+
+
+# ============================================================================
+# 文件处理
+# ============================================================================
+def process_single_file(input_file, output_dir=None, config=Config()):
+    """
+    处理单个.set文件
+    
+    参数:
+        input_file: 输入.set文件路径
+        output_dir: 输出目录，如果为None则使用输入文件所在目录
+        config: 配置对象
+    
+    返回:
+        output_files: list of 保存的文件路径
+    """
+    print(f"\n{'='*80}")
+    print(f"Processing: {os.path.basename(input_file)}")
+    print(f"{'='*80}")
+    
+    # 读取数据
+    try:
+        raw = mne.io.read_raw_eeglab(input_file, preload=True, verbose='ERROR')
+    except Exception as e:
+        print(f"ERROR: Failed to load file: {e}")
+        return []
+    
+    # 设置输出目录
+    if output_dir is None:
+        output_dir = os.path.join(os.path.dirname(input_file), 
+                                  os.path.basename(input_file).replace('.set', '_connectivity_features'))
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 切割数据
+    print(f"\n  Segmenting data into {config.WINDOW_SIZE}s windows...")
+    segments = segment_data(raw, window_size=config.WINDOW_SIZE, overlap=config.OVERLAP)
+    print(f"  Found {len(segments)} valid segments")
+    
+    if len(segments) == 0:
+        print("  WARNING: No valid segments found!")
+        return []
+    
+    # 提取特征
+    all_features = []
+    for idx, segment in enumerate(segments):
+        print(f"\n  Processing segment {idx+1}/{len(segments)}...")
+        features = extract_all_features(segment, config)
+        features['segment_id'] = idx
+        features['file_name'] = os.path.basename(input_file)
+        all_features.append(features)
+    
+    # 保存结果
+    print(f"\n  Saving results...")
+    output_files = save_features(all_features, output_dir, raw.ch_names)
+    
+    print(f"\n✓ Completed: {input_file}")
+    print(f"  Output directory: {output_dir}")
+    print(f"  Saved {len(output_files)} files")
+    
+    return output_files
+
+
+def visualize_connectivity_matrices(features, channel_names, output_dir, segment_id):
+    """
+    可视化单个片段的连接性矩阵
+    
+    参数:
+        features: dict 特征字典
+        channel_names: list 通道名列表
+        output_dir: str 输出目录
+        segment_id: int 片段编号
+    
+    返回:
+        viz_files: list of 生成的图片文件路径
+    """
+    viz_dir = os.path.join(output_dir, 'visualizations')
+    os.makedirs(viz_dir, exist_ok=True)
+    
+    viz_files = []
+    n_channels = len(channel_names)
+    
+    # 定义要可视化的关键矩阵
+    matrices_to_plot = {
+        # 基础相关
+        'pearson_corr': {
+            'title': 'Pearson Correlation',
+            'cmap': 'RdBu_r',
+            'vmin': -1,
+            'vmax': 1
+        },
+        'partial_corr': {
+            'title': 'Partial Correlation',
+            'cmap': 'RdBu_r',
+            'vmin': -1,
+            'vmax': 1
+        },
+        'spearman_corr': {
+            'title': 'Spearman Correlation',
+            'cmap': 'RdBu_r',
+            'vmin': -1,
+            'vmax': 1
+        },
+        # 相位同步 (Alpha频段)
+        'plv_alpha': {
+            'title': 'PLV (Alpha Band)',
+            'cmap': 'hot',
+            'vmin': 0,
+            'vmax': 1
+        },
+        'pli_alpha': {
+            'title': 'PLI (Alpha Band)',
+            'cmap': 'hot',
+            'vmin': 0,
+            'vmax': 1
+        },
+        'wpli_alpha': {
+            'title': 'wPLI (Alpha Band)',
+            'cmap': 'hot',
+            'vmin': 0,
+            'vmax': 1
+        },
+        # 频域相干 (Alpha频段)
+        'coherence_alpha': {
+            'title': 'Coherence (Alpha Band)',
+            'cmap': 'viridis',
+            'vmin': 0,
+            'vmax': 1
+        },
+        'icoh_alpha': {
+            'title': 'Imaginary Coherence (Alpha Band)',
+            'cmap': 'viridis',
+            'vmin': 0,
+            'vmax': 1
+        },
+        # 包络耦合
+        'aec_alpha': {
+            'title': 'Amplitude Envelope Correlation (Alpha)',
+            'cmap': 'coolwarm',
+            'vmin': -1,
+            'vmax': 1
+        },
+        # 有向连接
+        'granger_causality': {
+            'title': 'Granger Causality (i→j)',
+            'cmap': 'YlOrRd',
+            'vmin': None,  # 自动
+            'vmax': None
+        },
+        'transfer_entropy': {
+            'title': 'Transfer Entropy (i→j)',
+            'cmap': 'Purples',
+            'vmin': 0,
+            'vmax': None  # 自动
+        }
+    }
+    
+    # 1. 创建单独的热力图（每个矩阵一个文件）
+    for key, config in matrices_to_plot.items():
+        if key in features and isinstance(features[key], np.ndarray):
+            matrix = features[key]
+            
+            # 根据通道数动态调整图片大小和字体大小
+            # 确保即使通道很多也能看清所有标签
+            base_size = 0.3  # 每个通道的基础大小（英寸）
+            fig_width = max(10, n_channels * base_size)
+            fig_height = max(8, n_channels * base_size)
+            
+            # 根据通道数调整字体大小
+            if n_channels <= 10:
+                label_fontsize = 10
+            elif n_channels <= 20:
+                label_fontsize = 8
+            elif n_channels <= 30:
+                label_fontsize = 7
+            elif n_channels <= 50:
+                label_fontsize = 6
+            else:
+                label_fontsize = 5
+            
+            fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+            
+            # 使用seaborn绘制热力图，它对标签处理更好
+            sns.heatmap(matrix, 
+                       cmap=config['cmap'],
+                       vmin=config['vmin'], 
+                       vmax=config['vmax'],
+                       xticklabels=channel_names,
+                       yticklabels=channel_names,
+                       cbar_kws={'label': 'Value'},
+                       square=True,  # 保持正方形单元格
+                       linewidths=0,  # 不显示网格线
+                       ax=ax)
+            
+            # 设置标题
+            ax.set_title(f"{config['title']}\nSegment {segment_id} ({features['start_time']:.1f}s - {features['end_time']:.1f}s)",
+                        fontsize=14, fontweight='bold', pad=20)
+            
+            # 设置轴标签
+            ax.set_xlabel('Channels', fontsize=12, fontweight='bold')
+            ax.set_ylabel('Channels', fontsize=12, fontweight='bold')
+            
+            # 设置刻度标签 - 所有通道名都显示
+            ax.set_xticklabels(channel_names, rotation=90, ha='center', fontsize=label_fontsize)
+            ax.set_yticklabels(channel_names, rotation=0, ha='right', fontsize=label_fontsize)
+            
+            # 确保刻度标签不被裁剪
+            plt.setp(ax.get_xticklabels(), rotation=90, ha='center')
+            plt.setp(ax.get_yticklabels(), rotation=0, ha='right')
+            
+            plt.tight_layout()
+            
+            # 保存图片，使用更高的DPI以保持清晰度
+            filename = f'seg{segment_id:03d}_{key}.png'
+            filepath = os.path.join(viz_dir, filename)
+            plt.savefig(filepath, dpi=200, bbox_inches='tight')
+            plt.close(fig)
+            
+            viz_files.append(filepath)
+    
+    # 2. 创建综合对比图（多个矩阵在一起）
+    key_matrices = ['pearson_corr', 'plv_alpha', 'wpli_alpha', 'coherence_alpha']
+    available_matrices = [k for k in key_matrices if k in features and isinstance(features[k], np.ndarray)]
+    
+    if len(available_matrices) >= 2:
+        n_plots = len(available_matrices)
+        n_cols = 2
+        n_rows = (n_plots + 1) // 2
+        
+        # 根据通道数调整综合图大小
+        subplot_size = max(6, n_channels * 0.15)
+        fig_width = subplot_size * n_cols
+        fig_height = subplot_size * n_rows
+        
+        # 调整字体大小
+        if n_channels <= 15:
+            comp_fontsize = 5
+        elif n_channels <= 30:
+            comp_fontsize = 4
+        else:
+            comp_fontsize = 3
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_width, fig_height))
+        if n_rows == 1 and n_cols == 1:
+            axes = np.array([[axes]])
+        elif n_rows == 1:
+            axes = axes.reshape(1, -1)
+        elif n_cols == 1:
+            axes = axes.reshape(-1, 1)
+        
+        for idx, key in enumerate(available_matrices):
+            row = idx // n_cols
+            col = idx % n_cols
+            ax = axes[row, col]
+            
+            matrix = features[key]
+            config = matrices_to_plot[key]
+            
+            # 使用seaborn绘制热力图
+            sns.heatmap(matrix, 
+                       cmap=config['cmap'],
+                       vmin=config['vmin'], 
+                       vmax=config['vmax'],
+                       xticklabels=channel_names,
+                       yticklabels=channel_names,
+                       cbar_kws={'label': 'Value'},
+                       square=True,
+                       linewidths=0,
+                       ax=ax,
+                       cbar=True)
+            
+            ax.set_title(config['title'], fontsize=10, fontweight='bold')
+            ax.set_xlabel('Channels', fontsize=8)
+            ax.set_ylabel('Channels', fontsize=8)
+            
+            # 设置所有通道标签
+            ax.set_xticklabels(channel_names, rotation=90, ha='center', fontsize=comp_fontsize)
+            ax.set_yticklabels(channel_names, rotation=0, ha='right', fontsize=comp_fontsize)
+        
+        # 隐藏多余的子图
+        for idx in range(len(available_matrices), n_rows * n_cols):
+            row = idx // n_cols
+            col = idx % n_cols
+            axes[row, col].axis('off')
+        
+        plt.suptitle(f'Connectivity Matrices Comparison - Segment {segment_id}\n'
+                    f'Time: {features["start_time"]:.1f}s - {features["end_time"]:.1f}s',
+                    fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        
+        # 保存综合图
+        filename = f'seg{segment_id:03d}_comparison.png'
+        filepath = os.path.join(viz_dir, filename)
+        plt.savefig(filepath, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        
+        viz_files.append(filepath)
+    
+    # 3. 创建频段对比图（同一种连接性指标的不同频段）
+    for metric in ['plv', 'pli', 'wpli', 'coherence', 'icoh']:
+        bands = ['delta', 'theta', 'alpha', 'beta', 'gamma']
+        available_bands = [b for b in bands if f'{metric}_{b}' in features]
+        
+        if len(available_bands) >= 3:
+            # 根据通道数调整频段对比图大小
+            subplot_size = max(5, n_channels * 0.12)
+            fig_width = subplot_size * 3
+            fig_height = subplot_size * 2
+            
+            # 调整字体大小
+            if n_channels <= 15:
+                band_fontsize = 4
+            elif n_channels <= 30:
+                band_fontsize = 3
+            else:
+                band_fontsize = 2
+            
+            fig, axes = plt.subplots(2, 3, figsize=(fig_width, fig_height))
+            axes = axes.flatten()
+            
+            for idx, band in enumerate(available_bands[:6]):  # 最多6个
+                key = f'{metric}_{band}'
+                matrix = features[key]
+                
+                # 使用seaborn绘制热力图
+                sns.heatmap(matrix, 
+                           cmap='hot',
+                           vmin=0, 
+                           vmax=1,
+                           xticklabels=channel_names,
+                           yticklabels=channel_names,
+                           cbar_kws={'label': 'Value'},
+                           square=True,
+                           linewidths=0,
+                           ax=axes[idx],
+                           cbar=True)
+                
+                axes[idx].set_title(f'{band.upper()}', fontsize=10, fontweight='bold')
+                axes[idx].set_xlabel('Channels', fontsize=7)
+                axes[idx].set_ylabel('Channels', fontsize=7)
+                
+                # 设置所有通道标签
+                axes[idx].set_xticklabels(channel_names, rotation=90, ha='center', fontsize=band_fontsize)
+                axes[idx].set_yticklabels(channel_names, rotation=0, ha='right', fontsize=band_fontsize)
+            
+            # 隐藏多余子图
+            for idx in range(len(available_bands), 6):
+                axes[idx].axis('off')
+            
+            plt.suptitle(f'{metric.upper()} Across Frequency Bands - Segment {segment_id}\n'
+                        f'Time: {features["start_time"]:.1f}s - {features["end_time"]:.1f}s',
+                        fontsize=14, fontweight='bold')
+            plt.tight_layout()
+            
+            filename = f'seg{segment_id:03d}_{metric}_bands.png'
+            filepath = os.path.join(viz_dir, filename)
+            plt.savefig(filepath, dpi=200, bbox_inches='tight')
+            plt.close(fig)
+            
+            viz_files.append(filepath)
+            break  # 只创建一个频段对比图
+    
+    # 4. 可视化节点级别的图网络指标
+    print("      - Visualizing graph metrics...")
+    # 找到第一个可用的图网络指标集合
+    graph_prefix = None
+    for prefix in ['pearson_corr_graph', 'plv_alpha_graph']:
+        if f'{prefix}_node_degree' in features:
+            graph_prefix = prefix
+            break
+    
+    if graph_prefix:
+        # 提取节点级别的指标
+        node_metrics = {}
+        for metric_name in ['degree', 'strength', 'clustering', 'betweenness', 'eigenvector']:
+            key = f'{graph_prefix}_node_{metric_name}'
+            if key in features and isinstance(features[key], np.ndarray):
+                node_metrics[metric_name] = features[key]
+        
+        if node_metrics:
+            # 4.1 创建柱状图对比
+            n_metrics = len(node_metrics)
+            if n_metrics > 0:
+                fig_height = max(6, n_metrics * 2)
+                fig, axes = plt.subplots(n_metrics, 1, figsize=(max(12, n_channels * 0.3), fig_height))
+                if n_metrics == 1:
+                    axes = [axes]
+                
+                for idx, (metric_name, values) in enumerate(node_metrics.items()):
+                    axes[idx].bar(range(n_channels), values, color='steelblue', alpha=0.7, edgecolor='black')
+                    axes[idx].set_title(f'{metric_name.replace("_", " ").title()}', fontsize=12, fontweight='bold')
+                    axes[idx].set_xlabel('Channels', fontsize=10)
+                    axes[idx].set_ylabel('Value', fontsize=10)
+                    axes[idx].set_xticks(range(n_channels))
+                    
+                    # 根据通道数调整标签
+                    if n_channels <= 30:
+                        axes[idx].set_xticklabels(channel_names, rotation=90, ha='center', fontsize=7)
+                    else:
+                        tick_indices = np.linspace(0, n_channels-1, min(20, n_channels), dtype=int)
+                        axes[idx].set_xticks(tick_indices)
+                        axes[idx].set_xticklabels([channel_names[i] for i in tick_indices], rotation=90, fontsize=6)
+                    
+                    axes[idx].grid(True, alpha=0.3, axis='y')
+                
+                plt.suptitle(f'Node-level Graph Metrics - Segment {segment_id}\n'
+                            f'Time: {features["start_time"]:.1f}s - {features["end_time"]:.1f}s\n'
+                            f'Based on {graph_prefix.replace("_graph", "")}',
+                            fontsize=14, fontweight='bold')
+                plt.tight_layout()
+                
+                filename = f'seg{segment_id:03d}_graph_node_metrics.png'
+                filepath = os.path.join(viz_dir, filename)
+                plt.savefig(filepath, dpi=200, bbox_inches='tight')
+                plt.close(fig)
+                viz_files.append(filepath)
+            
+            # 4.2 创建网络拓扑图（只在通道数<=30时绘制，避免过于密集）
+            if n_channels <= 30 and f'{graph_prefix}_node_community' in features:
+                try:
+                    # 获取连接矩阵
+                    conn_key = graph_prefix.replace('_graph', '')
+                    if conn_key in features:
+                        conn_matrix = features[conn_key]
+                        node_size = features[f'{graph_prefix}_node_degree']
+                        node_community = features[f'{graph_prefix}_node_community']
+                        
+                        # 创建稀疏图
+                        conn = np.abs(conn_matrix.copy())
+                        np.fill_diagonal(conn, 0)
+                        threshold = np.percentile(conn.flatten(), 80)  # 只保留前20%连接
+                        conn[conn < threshold] = 0
+                        
+                        G = nx.from_numpy_array(conn)
+                        
+                        # 使用spring layout布局
+                        pos = nx.spring_layout(G, k=1/np.sqrt(n_channels), iterations=50, seed=42)
+                        
+                        # 绘制网络
+                        fig, ax = plt.subplots(figsize=(14, 14))
+                        
+                        # 为每个社区分配颜色
+                        unique_communities = np.unique(node_community)
+                        colors = plt.cm.tab10(np.linspace(0, 1, len(unique_communities)))
+                        node_colors = [colors[node_community[i]] for i in range(n_channels)]
+                        
+                        # 节点大小基于degree
+                        node_sizes = (node_size / node_size.max() * 2000 + 300) if node_size.max() > 0 else [500] * n_channels
+                        
+                        # 绘制边
+                        nx.draw_networkx_edges(G, pos, alpha=0.2, width=1, ax=ax)
+                        
+                        # 绘制节点
+                        nx.draw_networkx_nodes(G, pos, node_color=node_colors, 
+                                              node_size=node_sizes, alpha=0.8, ax=ax)
+                        
+                        # 绘制标签
+                        nx.draw_networkx_labels(G, pos, dict(enumerate(channel_names)), 
+                                               font_size=8, font_weight='bold', ax=ax)
+                        
+                        ax.set_title(f'Network Topology - Segment {segment_id}\n'
+                                    f'Time: {features["start_time"]:.1f}s - {features["end_time"]:.1f}s\n'
+                                    f'Node size ∝ degree, Colors = communities',
+                                    fontsize=14, fontweight='bold', pad=20)
+                        ax.axis('off')
+                        
+                        plt.tight_layout()
+                        
+                        filename = f'seg{segment_id:03d}_network_topology.png'
+                        filepath = os.path.join(viz_dir, filename)
+                        plt.savefig(filepath, dpi=200, bbox_inches='tight')
+                        plt.close(fig)
+                        viz_files.append(filepath)
+                        
+                except Exception as e:
+                    print(f"        Warning: Network topology visualization failed: {e}")
+    
+    return viz_files
+
+
+def save_features(all_features, output_dir, channel_names):
+    """
+    保存提取的特征到文件
+    
+    参数:
+        all_features: list of dict
+        output_dir: 输出目录
+        channel_names: 通道名列表
+    
+    返回:
+        output_files: list of 保存的文件路径
+    """
+    output_files = []
+    
+    # 1. 保存标量特征到CSV
+    scalar_features = []
+    for features in all_features:
+        scalar_dict = {
+            'segment_id': features['segment_id'],
+            'start_time': features['start_time'],
+            'end_time': features['end_time'],
+            'duration': features['duration'],
+            'n_channels': features['n_channels'],
+            'file_name': features['file_name']
+        }
+        
+        # 添加图网络指标
+        for key, value in features.items():
+            if 'graph_' in key or 'dfc_' in key:
+                scalar_dict[key] = value
+        
+        scalar_features.append(scalar_dict)
+    
+    df_scalar = pd.DataFrame(scalar_features)
+    csv_path = os.path.join(output_dir, 'scalar_features.csv')
+    df_scalar.to_csv(csv_path, index=False)
+    output_files.append(csv_path)
+    print(f"    ✓ Saved scalar features: {csv_path}")
+    
+    # 2. 保存连接矩阵和节点指标到.npz文件并生成可视化
+    print(f"    ✓ Saving connectivity matrices and generating visualizations...")
+    for idx, features in enumerate(all_features):
+        arrays_dict = {}
+        
+        for key, value in features.items():
+            # 保存所有numpy数组（2D矩阵和1D节点级别指标）
+            if isinstance(value, np.ndarray) and value.ndim in [1, 2]:
+                arrays_dict[key] = value
+        
+        if arrays_dict:
+            npz_path = os.path.join(output_dir, f'connectivity_matrices_seg{idx:03d}.npz')
+            np.savez_compressed(npz_path, **arrays_dict)
+            output_files.append(npz_path)
+            
+            # 生成可视化
+            try:
+                viz_files = visualize_connectivity_matrices(features, channel_names, output_dir, idx)
+                output_files.extend(viz_files)
+                if idx == 0:  # 只在第一个片段时显示消息
+                    print(f"      ✓ Generated {len(viz_files)} visualization plots per segment")
+            except Exception as e:
+                print(f"      Warning: Visualization failed for segment {idx}: {e}")
+    
+    print(f"    ✓ Saved {len(all_features)} connectivity matrix files with visualizations")
+    
+    # 3. 保存通道名
+    channel_file = os.path.join(output_dir, 'channel_names.txt')
+    with open(channel_file, 'w') as f:
+        for ch in channel_names:
+            f.write(f"{ch}\n")
+    output_files.append(channel_file)
+    print(f"    ✓ Saved channel names: {channel_file}")
+    
+    # 4. 保存汇总统计
+    summary_dict = {
+        'n_segments': len(all_features),
+        'n_channels': all_features[0]['n_channels'] if all_features else 0,
+        'window_size': all_features[0]['duration'] if all_features else 0,
+        'total_duration': sum([f['duration'] for f in all_features]),
+        'channel_names': channel_names
+    }
+    
+    summary_file = os.path.join(output_dir, 'summary.txt')
+    with open(summary_file, 'w') as f:
+        for key, value in summary_dict.items():
+            if key != 'channel_names':
+                f.write(f"{key}: {value}\n")
+            else:
+                f.write(f"channel_names: {', '.join(value)}\n")
+    output_files.append(summary_file)
+    print(f"    ✓ Saved summary: {summary_file}")
+    
+    return output_files
+
+
+def process_batch(input_dir, pattern="*_merged_*.set", output_base_dir=None, config=Config()):
+    """
+    批量处理目录下的所有匹配文件
+    
+    参数:
+        input_dir: 输入目录
+        pattern: 文件匹配模式
+        output_base_dir: 输出基础目录
+        config: 配置对象
+    
+    返回:
+        processed_files: list of (input_file, output_dir)
+    """
+    print(f"\n{'='*80}")
+    print(f"Batch Processing")
+    print(f"{'='*80}")
+    print(f"Input directory: {input_dir}")
+    print(f"Pattern: {pattern}")
+    
+    # 查找所有匹配文件
+    input_path = Path(input_dir)
+    set_files = list(input_path.rglob(pattern))
+    
+    print(f"\nFound {len(set_files)} matching files")
+    
+    if len(set_files) == 0:
+        print("ERROR: No matching files found!")
+        return []
+    
+    # 处理每个文件
+    processed_files = []
+    failed_files = []
+    
+    for idx, set_file in enumerate(set_files):
+        print(f"\n{'='*80}")
+        print(f"File {idx+1}/{len(set_files)}")
+        print(f"{'='*80}")
+        
+        try:
+            # 设置输出目录
+            if output_base_dir:
+                rel_path = set_file.relative_to(input_path)
+                output_dir = os.path.join(output_base_dir, 
+                                         str(rel_path.parent), 
+                                         set_file.stem + '_connectivity_features')
+            else:
+                output_dir = None
+            
+            # 处理文件
+            output_files = process_single_file(str(set_file), output_dir, config)
+            
+            if output_files:
+                processed_files.append((str(set_file), output_dir))
+        
+        except Exception as e:
+            print(f"\nERROR processing {set_file}: {e}")
+            import traceback
+            traceback.print_exc()
+            failed_files.append(str(set_file))
+    
+    # 打印汇总
+    print(f"\n{'='*80}")
+    print(f"Batch Processing Complete")
+    print(f"{'='*80}")
+    print(f"Successfully processed: {len(processed_files)}/{len(set_files)} files")
+    if failed_files:
+        print(f"\nFailed files ({len(failed_files)}):")
+        for f in failed_files:
+            print(f"  - {f}")
+    
+    return processed_files
+
+
+# ============================================================================
+# 命令行接口
+# ============================================================================
+def main():
+    parser = argparse.ArgumentParser(
+        description="提取EEG连接性特征",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+功能说明:
+  对30s窗口的EEG数据提取全面的连接性特征，包括：
+  - 线性/非线性相关
+  - 相位同步
+  - 频域相干
+  - 包络耦合
+  - 有向连接
+  - 图网络指标
+  - 动态连接
+  - 统计显著性
+
+输出:
+  - scalar_features.csv: 标量特征（图指标、动态指标等）
+  - connectivity_matrices_segXXX.npz: 连接矩阵（每个片段）
+  - channel_names.txt: 通道名列表
+  - summary.txt: 汇总信息
+
+使用示例:
+  # 处理单个文件
+  python extract_connectivity_features.py --input_file "data/patient1_merged_channels.set"
+  
+  # 批量处理
+  python extract_connectivity_features.py --input_dir "data/" --pattern "*_merged_*.set"
+  
+  # 指定输出目录
+  python extract_connectivity_features.py --input_dir "data/" --output_dir "results/"
+  
+  # 自定义参数
+  python extract_connectivity_features.py --input_file "data.set" --window_size 60 --n_permutations 1000
+        """
+    )
+    
+    # 输入参数
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--input_file', help="输入单个.set文件")
+    group.add_argument('--input_dir', help="输入目录（批量处理）")
+    
+    parser.add_argument('--output_dir', help="输出目录")
+    parser.add_argument('--pattern', default="*_merged_*.set", 
+                       help="文件匹配模式（批量处理时使用），默认: *_merged_*.set")
+    
+    # 参数配置
+    parser.add_argument('--window_size', type=float, default=30, 
+                       help="窗口大小（秒），默认: 30")
+    parser.add_argument('--overlap', type=float, default=0, 
+                       help="窗口重叠（秒），默认: 0")
+    parser.add_argument('--dfc_window', type=float, default=2, 
+                       help="动态连接窗口大小（秒），默认: 2")
+    parser.add_argument('--dfc_step', type=float, default=1, 
+                       help="动态连接步长（秒），默认: 1")
+    parser.add_argument('--n_permutations', type=int, default=500, 
+                       help="置换检验次数，默认: 500")
+    parser.add_argument('--sparsity', type=float, default=0.2, 
+                       help="图网络稀疏度阈值，默认: 0.2")
+    
+    args = parser.parse_args()
+    
+    # 创建配置
+    config = Config()
+    config.WINDOW_SIZE = args.window_size
+    config.OVERLAP = args.overlap
+    config.DFC_WINDOW = args.dfc_window
+    config.DFC_STEP = args.dfc_step
+    config.N_PERMUTATIONS = args.n_permutations
+    config.SPARSITY_THRESHOLD = args.sparsity
+    
+    # 处理文件
+    if args.input_file:
+        # 单文件处理
+        process_single_file(args.input_file, args.output_dir, config)
+    else:
+        # 批量处理
+        process_batch(args.input_dir, args.pattern, args.output_dir, config)
+    
+    print("\n✓ All done!")
+
+
+if __name__ == "__main__":
+    # 如果不提供命令行参数，显示帮助
+    import sys
+    if len(sys.argv) == 1:
+        sys.argv.extend([
+            '--input_dir', r'E:\DataSet\EEG\EEG dataset_SUAT_processed',
+            '--output_dir', r'E:\output\connectivity_features',
+            '--pattern', '*_merged_*.set'
+        ])
+    sys.exit(main())
+
