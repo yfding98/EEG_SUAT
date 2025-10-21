@@ -1,0 +1,64 @@
+# 原始EEG数据训练配置文件
+
+# 数据设置
+data:
+  data_root: "E:\\DataSet\\EEG\\EEG dataset_SUAT_processed"
+  labels_csv: "E:\\output\\connectivity_features\\labels.csv"
+  window_size: 6.0  # 窗口大小（秒）
+  overlap: 0.0  # 窗口重叠比例 (0-1)
+
+# 模型设置
+model:
+  model_type: "lightweight"  # 'spatiotemporal' 或 'lightweight'
+  n_classes: 5  # 分类类别数
+  
+  # SpatioTemporalEEGNet 参数
+  spatiotemporal:
+    n_filters: 64
+    d_model: 256
+    n_heads: 8
+    n_layers: 4
+    dropout: 0.3
+  
+  # LightweightEEGNet 参数
+  lightweight:
+    dropout: 0.5
+
+# 训练设置
+training:
+  batch_size: 32
+  n_epochs: 100
+  lr: 0.001
+  weight_decay: 0.0001
+  
+  # 数据分割
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  
+  # 学习率调度器
+  scheduler:
+    type: "cosine"  # 'cosine', 'step', 'plateau'
+    step_size: 30  # for 'step'
+    gamma: 0.1  # for 'step'
+  
+  # Early stopping
+  early_stopping_patience: 20
+  
+  # 优化器
+  optimizer: "adamw"  # 'adam', 'adamw', 'sgd'
+
+# 增强设置
+augmentation:
+  use_mixup: false
+  mixup_alpha: 1.0
+  use_label_smoothing: false
+  label_smoothing: 0.1
+
+# 其他设置
+misc:
+  seed: 42
+  num_workers: 0  # Windows下建议设为0
+  save_dir: "checkpoints"
+  use_cache: true
+

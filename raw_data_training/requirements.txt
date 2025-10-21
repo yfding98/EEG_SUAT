@@ -1,0 +1,28 @@
+# 原始EEG数据训练系统依赖
+
+# 核心依赖
+torch>=2.0.0
+numpy>=1.23.0
+pandas>=1.5.0
+
+# EEG数据处理
+mne>=1.5.0
+
+# 数据可视化
+matplotlib>=3.6.0
+seaborn>=0.12.0
+
+# 训练工具
+tensorboard>=2.13.0
+tqdm>=4.65.0
+
+# 配置文件
+pyyaml>=6.0
+
+# 科学计算
+scipy>=1.10.0
+scikit-learn>=1.2.0
+
+# 可选依赖（用于加速）
+# numba>=0.57.0  # 数值计算加速
+
