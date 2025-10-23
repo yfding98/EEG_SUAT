@@ -170,17 +170,12 @@ class FocalBCELoss(nn.Module):
     """
     Focal BCE Loss for 活跃通道检测
     解决类别不平衡（活跃通道通常只有2-5个，非活跃有16-19个）
-    
-    改进：
-    1. 添加pos_weight来增加正样本权重
-    2. 使用更激进的focal参数
     """
     
-    def __init__(self, alpha=0.25, gamma=2.0, pos_weight=None):
+    def __init__(self, alpha=0.25, gamma=2.0):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
-        self.pos_weight = pos_weight
     
     def forward(self, logits, targets):
         """
@@ -188,15 +183,8 @@ class FocalBCELoss(nn.Module):
             logits: (batch, n_channels)
             targets: (batch, n_channels) binary, 1=活跃, 0=非活跃
         """
-        # BCE with pos_weight
-        if self.pos_weight is not None:
-            bce = F.binary_cross_entropy_with_logits(
-                logits, targets, 
-                pos_weight=self.pos_weight,
-                reduction='none'
-            )
-        else:
-            bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        # BCE
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
         
         # Focal weight
         probs = torch.sigmoid(logits)
@@ -210,51 +198,6 @@ class FocalBCELoss(nn.Module):
         loss = alpha_weight * focal_weight * bce
         
         return loss.mean()
-
-
-class BalancedBCEWithCardinality(nn.Module):
-    """
-    带基数约束的平衡BCE损失
-    
-    解决问题：
-    1. 使用pos_weight严重惩罚FN（漏检活跃通道）
-    2. 添加基数损失，鼓励模型预测合理数量的活跃通道（2-5个）
-    """
-    
-    def __init__(self, pos_weight=10.0, cardinality_weight=0.5, expected_active=(2, 5)):
-        super().__init__()
-        self.pos_weight = pos_weight
-        self.cardinality_weight = cardinality_weight
-        self.expected_min, self.expected_max = expected_active
-    
-    def forward(self, logits, targets):
-        """
-        Args:
-            logits: (batch, n_channels)
-            targets: (batch, n_channels)
-        """
-        batch_size = logits.size(0)
-        
-        # 1. Weighted BCE（严重惩罚漏检）
-        pos_weight_tensor = torch.tensor([self.pos_weight], device=logits.device)
-        bce_loss = F.binary_cross_entropy_with_logits(
-            logits, targets, 
-            pos_weight=pos_weight_tensor,
-            reduction='mean'
-        )
-        
-        # 2. 基数损失：鼓励预测合理数量的活跃通道
-        probs = torch.sigmoid(logits)
-        predicted_count = probs.sum(dim=1)  # (batch,)
-        true_count = targets.sum(dim=1)  # (batch,)
-        
-        # 惩罚预测数量与真实数量差距过大的情况
-        cardinality_loss = F.mse_loss(predicted_count, true_count)
-        
-        # 总损失
-        total_loss = bce_loss + self.cardinality_weight * cardinality_loss
-        
-        return total_loss
 
 
 def create_channel_detector(n_channels=21, n_samples=1500, **kwargs):
