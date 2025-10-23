@@ -357,6 +357,8 @@ def main():
                         help='时间窗口大小（秒）')
     parser.add_argument('--window_stride', type=float, default=3.0,
                         help='窗口步长（秒）')
+    parser.add_argument('--target_sfreq', type=float, default=250.0,
+                        help='目标采样率（Hz），所有数据会重采样到此频率')
     
     # 模型参数
     parser.add_argument('--d_model', type=int, default=256)
@@ -422,7 +424,8 @@ def main():
             val_split=args.val_split,
             test_split=args.test_split,
             num_workers=0,
-            seed=args.seed
+            seed=args.seed,
+            target_sfreq=args.target_sfreq
         )
         
         # 从loader获取样本信息

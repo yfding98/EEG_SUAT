@@ -141,6 +141,7 @@ class SelectedSegmentDataset(Dataset):
     2. 从文件名解析异常通道标签
     3. 按窗口切分数据
     4. 提取多频段特征
+    5. 统一采样率（重采样）
     """
     
     def __init__(
@@ -149,7 +150,8 @@ class SelectedSegmentDataset(Dataset):
         window_size=6.0,
         window_stride=3.0,
         pattern="*_selected_*.set",
-        use_multiband=True
+        use_multiband=True,
+        target_sfreq=250.0  # 目标采样率
     ):
         """
         参数:
@@ -158,11 +160,13 @@ class SelectedSegmentDataset(Dataset):
             window_stride: 窗口步长（秒）
             pattern: 文件匹配模式
             use_multiband: 是否使用多频段特征
+            target_sfreq: 目标采样率（Hz），所有数据会重采样到此采样率
         """
         self.data_root = Path(data_root)
         self.window_size = window_size
         self.window_stride = window_stride
         self.use_multiband = use_multiband
+        self.target_sfreq = target_sfreq
         
         # 查找所有_selected文件
         self.file_list = list(self.data_root.rglob(pattern))
@@ -198,9 +202,16 @@ class SelectedSegmentDataset(Dataset):
                 # 读取EEG数据
                 raw = mne.io.read_raw_eeglab(str(file_path), preload=True, verbose='ERROR')
                 
+                original_sfreq = raw.info['sfreq']
+                
+                # 重采样到目标采样率（如果需要）
+                if abs(original_sfreq - self.target_sfreq) > 1e-3:
+                    print(f"  Resampling from {original_sfreq}Hz to {self.target_sfreq}Hz...")
+                    raw.resample(self.target_sfreq, npad='auto', verbose='ERROR')
+                
                 # 获取数据
                 data = raw.get_data()  # (n_channels, n_samples)
-                fs = raw.info['sfreq']
+                fs = raw.info['sfreq']  # 应该等于target_sfreq
                 
                 # 保存通道名称（第一次）
                 if self.channel_names is None:
@@ -300,6 +311,8 @@ class SelectedSegmentDataset(Dataset):
         print(f"  Channels: {len(self.channel_names)}")
         print(f"  Window size: {self.window_size}s")
         print(f"  Window stride: {self.window_stride}s")
+        print(f"  Unified sampling rate: {self.target_sfreq}Hz")
+        print(f"  Expected samples per window: {int(self.window_size * self.target_sfreq)}")
         print(f"{'='*80}\n")
     
     def __len__(self):
@@ -316,8 +329,13 @@ class SelectedSegmentDataset(Dataset):
             # 提取多频段特征
             bands = extract_multiband_features(data, fs)
             
-            # 转换为torch tensors
-            bands_tensor = [torch.from_numpy(band.astype(np.float32)) for band in bands]
+            # 裁剪到合理范围并转换为torch tensors（避免overflow）
+            bands_tensor = []
+            for band in bands:
+                # 裁剪到float32可表示的范围
+                band_clipped = np.clip(band, -1e10, 1e10)
+                bands_tensor.append(torch.from_numpy(band_clipped.astype(np.float32)))
+            
             labels_tensor = torch.from_numpy(labels)
             
             return {
@@ -376,7 +394,8 @@ def create_dataloaders(
     val_split=0.15,
     test_split=0.15,
     num_workers=0,
-    seed=42
+    seed=42,
+    target_sfreq=250.0
 ):
     """
     创建训练、验证和测试数据加载器
@@ -390,6 +409,7 @@ def create_dataloaders(
         test_split: 测试集比例
         num_workers: 数据加载线程数
         seed: 随机种子
+        target_sfreq: 目标采样率（Hz）
     
     返回:
         train_loader, val_loader, test_loader, channel_names
@@ -399,7 +419,8 @@ def create_dataloaders(
         data_root=data_root,
         window_size=window_size,
         window_stride=window_stride,
-        use_multiband=True
+        use_multiband=True,
+        target_sfreq=target_sfreq
     )
     
     # 划分数据集
