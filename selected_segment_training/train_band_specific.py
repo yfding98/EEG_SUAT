@@ -60,6 +60,31 @@ class BandSpecificDataset:
         }
 
 
+def collate_band_specific(batch):
+    """
+    自定义collate函数，处理频段特定数据
+    处理abnormal_channels列表长度不一致的问题
+    """
+    # 分离可stack的数据和列表数据
+    data = torch.stack([item['data'] for item in batch])
+    labels = torch.stack([item['labels'] for item in batch])
+    fs = torch.tensor([item['fs'] for item in batch])
+    
+    # 列表数据保持为列表
+    files = [item['file'] for item in batch]
+    abnormal_channels = [item['abnormal_channels'] for item in batch]
+    band_names = [item['band_name'] for item in batch]
+    
+    return {
+        'data': data,
+        'labels': labels,
+        'fs': fs,
+        'files': files,
+        'abnormal_channels': abnormal_channels,
+        'band_names': band_names
+    }
+
+
 def create_band_specific_dataloaders(
     data_root,
     band_index,
@@ -90,12 +115,13 @@ def create_band_specific_dataloaders(
     val_dataset = BandSpecificDataset(val_loader.dataset, band_index)
     test_dataset = BandSpecificDataset(test_loader.dataset, band_index)
     
-    # 创建新的数据加载器
+    # 创建新的数据加载器（使用自定义collate函数）
     train_loader_band = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
+        collate_fn=collate_band_specific,
         pin_memory=True
     )
     
@@ -104,6 +130,7 @@ def create_band_specific_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
+        collate_fn=collate_band_specific,
         pin_memory=True
     )
     
@@ -112,6 +139,7 @@ def create_band_specific_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
+        collate_fn=collate_band_specific,
         pin_memory=True
     )
     
@@ -230,11 +258,9 @@ class BandSpecificTrainer:
             data = batch['data'].to(self.device)  # (batch, n_channels, n_samples)
             labels = batch['labels'].to(self.device)  # (batch, n_channels)
             
-            # 将单频段数据包装成多频段格式（只有一个频段）
-            bands = [data]  # List with single element
-            
+            # 对于单频段数据，直接传递tensor
             # Forward
-            scores = self.model(bands)
+            scores = self.model(data)
             
             # Loss
             loss, loss_dict = self.criterion(
@@ -268,7 +294,7 @@ class BandSpecificTrainer:
             })
             
             # 显式释放
-            del data, labels, bands, scores, loss
+            del data, labels, scores, loss
             
             if batch_idx % 10 == 0:
                 torch.cuda.empty_cache()
@@ -305,10 +331,8 @@ class BandSpecificTrainer:
             data = batch['data'].to(self.device)
             labels = batch['labels'].to(self.device)
             
-            bands = [data]
-            
             # Forward
-            scores = self.model(bands)
+            scores = self.model(data)
             
             # Loss
             loss, loss_dict = self.criterion(
@@ -331,7 +355,7 @@ class BandSpecificTrainer:
                 'F1': f'{metrics_meter["f1"].avg:.1f}%'
             })
             
-            del data, labels, bands, scores, loss
+            del data, labels, scores, loss
         
         torch.cuda.empty_cache()
         
@@ -674,7 +698,11 @@ def main():
     print(f"{'='*100}")
     
     for band_name, metrics in results.items():
-        print(f"{band_name:>8}: 验证F1={metrics['best_val_f1']:6.2f}%, 测试F1={metrics['test_f1']:6.2f}%")
+        if ('best_val_f1' in metrics and 'test_f1' in metrics and 
+            metrics['best_val_f1'] is not None and metrics['test_f1'] is not None):
+            print(f"{band_name:>8}: 验证F1={metrics['best_val_f1']:6.2f}%, 测试F1={metrics['test_f1']:6.2f}%")
+        else:
+            print(f"{band_name:>8}: 训练失败")
     
     # 保存汇总结果
     summary_path = Path(args.save_dir) / 'training_summary.json'

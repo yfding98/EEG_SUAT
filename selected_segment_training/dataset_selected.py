@@ -350,7 +350,9 @@ class SelectedSegmentDataset(Dataset):
             return {
                 'bands': bands_tensor,
                 'labels': labels_tensor,
-                'file': window['file']
+                'file': window['file'],
+                'fs': fs,
+                'abnormal_channels': window['abnormal_channels']
             }
         else:
             # 单频段（原始数据）
@@ -360,7 +362,9 @@ class SelectedSegmentDataset(Dataset):
             return {
                 'data': data_tensor,
                 'labels': labels_tensor,
-                'file': window['file']
+                'file': window['file'],
+                'fs': fs,
+                'abnormal_channels': window['abnormal_channels']
             }
 
 
