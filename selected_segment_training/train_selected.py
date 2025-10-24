@@ -220,6 +220,17 @@ class Trainer:
         
         loader = self.val_loader if phase == 'Val' else self.test_loader
         
+        # 如果验证/测试集为空，返回默认值
+        if len(loader.dataset) == 0:
+            return {
+                'loss': 0.0,
+                'precision': 0.0,
+                'recall': 0.0,
+                'f1': 0.0,
+                'top1_accuracy': 0.0,
+                'iou': 0.0
+            }
+        
         pbar = tqdm(loader, desc=f"Epoch {epoch} [{phase}]")
         for batch in pbar:
             bands = batch['bands']
@@ -271,6 +282,11 @@ class Trainer:
         print(f"验证集: {len(self.val_loader.dataset)}")
         print(f"测试集: {len(self.test_loader.dataset)}")
         
+        if len(self.val_loader.dataset) == 0:
+            print("\n⚠ 警告：验证集为空，将使用训练指标进行模型选择")
+        if len(self.test_loader.dataset) == 0:
+            print("⚠ 警告：测试集为空")
+        
         for epoch in range(1, n_epochs + 1):
             # 训练
             train_metrics = self.train_epoch(epoch)
@@ -296,11 +312,19 @@ class Trainer:
                   f"Recall: {val_metrics['recall']:.2f}%")
             print(f"  LR: {current_lr:.6f}")
             
-            # 保存最佳模型
-            is_best = val_metrics['f1'] > self.best_val_f1
-            if is_best:
-                self.best_val_f1 = val_metrics['f1']
-                print(f"  -> 新的最佳F1: {val_metrics['f1']:.2f}%")
+            # 保存最佳模型（如果验证集为空，使用训练F1）
+            if len(self.val_loader.dataset) == 0:
+                # 验证集为空时，每个epoch都保存为最佳（或使用训练F1判断）
+                current_f1 = train_metrics['f1']
+                is_best = current_f1 > self.best_val_f1
+                if is_best:
+                    self.best_val_f1 = current_f1
+                    print(f"  -> 新的最佳训练F1: {current_f1:.2f}% (验证集为空)")
+            else:
+                is_best = val_metrics['f1'] > self.best_val_f1
+                if is_best:
+                    self.best_val_f1 = val_metrics['f1']
+                    print(f"  -> 新的最佳验证F1: {val_metrics['f1']:.2f}%")
             
             save_checkpoint(
                 {
@@ -315,16 +339,30 @@ class Trainer:
                 self.save_dir
             )
             
-            # Early stopping
-            self.early_stopping(val_metrics['f1'])
+            # Early stopping（如果验证集为空，使用训练F1）
+            if len(self.val_loader.dataset) == 0:
+                self.early_stopping(train_metrics['f1'])
+            else:
+                self.early_stopping(val_metrics['f1'])
+            
             if self.early_stopping.early_stop:
                 print(f"\nEarly stopping at epoch {epoch}")
                 break
         
-        # 测试集
-        print("\n在测试集上评估...")
-        checkpoint = torch.load(self.save_dir / 'best_model.pth', weights_only=False)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # 测试集（如果存在best_model.pth就加载，否则使用当前模型）
+        best_model_path = self.save_dir / 'best_model.pth'
+        if best_model_path.exists():
+            print("\n加载最佳模型并在测试集上评估...")
+            checkpoint = torch.load(best_model_path, weights_only=False)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            print("\n使用当前模型在测试集上评估...")
+            # 手动保存一个best_model（使用最后的checkpoint）
+            checkpoint_path = self.save_dir / 'checkpoint.pth'
+            if checkpoint_path.exists():
+                import shutil
+                shutil.copyfile(checkpoint_path, best_model_path)
+                print("  (已将最后的checkpoint复制为best_model.pth)")
         
         test_metrics = self.validate(n_epochs, 'Test')
         

@@ -217,10 +217,19 @@ class SelectedSegmentDataset(Dataset):
                 if self.channel_names is None:
                     self.channel_names = raw.ch_names
                 
-                # 检查通道一致性
-                if raw.ch_names != self.channel_names:
-                    print(f"  Warning: Channel mismatch, skipping file")
+                # 检查通道一致性（允许不同顺序，但通道集合必须相同）
+                if set(raw.ch_names) != set(self.channel_names):
+                    print(f"  Warning: Channel set mismatch, skipping file")
+                    print(f"    Expected: {sorted(self.channel_names)}")
+                    print(f"    Got: {sorted(raw.ch_names)}")
                     continue
+                
+                # 如果通道顺序不同，重新排序到标准顺序
+                if raw.ch_names != self.channel_names:
+                    print(f"  Reordering channels to match standard order...")
+                    # 重新排序数据到标准通道顺序
+                    reorder_indices = [raw.ch_names.index(ch) for ch in self.channel_names]
+                    data = data[reorder_indices]
                 
                 n_channels, n_samples = data.shape
                 
@@ -423,19 +432,33 @@ def create_dataloaders(
         target_sfreq=target_sfreq
     )
     
-    # 划分数据集
+    # 划分数据集（智能处理小样本情况）
     total_size = len(full_dataset)
-    test_size = int(test_split * total_size)
-    val_size = int(val_split * total_size)
-    train_size = total_size - test_size - val_size
     
-    from torch.utils.data import random_split
-    
-    train_dataset, val_dataset, test_dataset = random_split(
-        full_dataset,
-        [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(seed)
-    )
+    # 当样本数太少时，调整划分策略
+    if total_size < 20:
+        print(f"\n警告：样本数较少 ({total_size})，建议减小window_stride增加样本数")
+        print("  当前策略：使用所有数据作为训练集，不划分验证/测试集")
+        
+        train_size = total_size
+        val_size = 0
+        test_size = 0
+        
+        train_dataset = full_dataset
+        val_dataset = torch.utils.data.Subset(full_dataset, [])  # 空数据集
+        test_dataset = torch.utils.data.Subset(full_dataset, [])  # 空数据集
+    else:
+        test_size = max(1, int(test_split * total_size))
+        val_size = max(1, int(val_split * total_size))
+        train_size = total_size - test_size - val_size
+        
+        from torch.utils.data import random_split
+        
+        train_dataset, val_dataset, test_dataset = random_split(
+            full_dataset,
+            [train_size, val_size, test_size],
+            generator=torch.Generator().manual_seed(seed)
+        )
     
     # 创建DataLoaders
     train_loader = DataLoader(
