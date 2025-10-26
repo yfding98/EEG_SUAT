@@ -1,25 +1,36 @@
+
 #!/bin/bash
 # 贝叶斯优化运行脚本示例
+
+# ============================================
+# 配置变量
+# ============================================
+TRAIN_SCRIPT="train_channel_aware_kfold_optimized.py"
+DATA_ROOT="/mnt/hd1/dyf/workspace/EEG_SUAT/EEG dataset_SUAT_processed_selected"
+SAVE_DIR="bayesian_search_results"
+N_TRIALS=50
+N_FOLDS=5
+N_EPOCHS=30
 
 # ============================================
 # 基础贝叶斯优化（推荐）
 # 使用Optuna的TPE算法，比网格搜索更高效
 # ============================================
 python bayesian_search.py \
-    --data_root "/mnt/hd1/dyf/workspace/EEG_SUAT/EEG dataset_SUAT_processed_selected" \
-    --train_script "train_channel_aware_kfold_optimized.py" \
-    --save_dir "bayesian_search_results" \
-    --n_trials 50 \
-    --n_folds 5 \
-    --n_epochs 30
+    --data_root "$DATA_ROOT" \
+    --train_script "$TRAIN_SCRIPT" \
+    --save_dir "$SAVE_DIR" \
+    --n_trials "$N_TRIALS" \
+    --n_folds "$N_FOLDS" \
+    --n_epochs "$N_EPOCHS"
 
 # ============================================
 # 快速测试（少量试验）
 # ============================================
 # python bayesian_search.py \
-#     --data_root "/mnt/hd1/dyf/workspace/EEG_SUAT/EEG dataset_SUAT_processed_selected" \
-#     --train_script "train_channel_aware_kfold_optimized.py" \
-#     --save_dir "bayesian_search_results" \
+#     --data_root "$DATA_ROOT" \
+#     --train_script "$TRAIN_SCRIPT" \
+#     --save_dir "$SAVE_DIR" \
 #     --n_trials 10 \
 #     --n_folds 3 \
 #     --n_epochs 15
@@ -28,9 +39,9 @@ python bayesian_search.py \
 # 大规模优化（100次试验）
 # ============================================
 # python bayesian_search.py \
-#     --data_root "/mnt/hd1/dyf/workspace/EEG_SUAT/EEG dataset_SUAT_processed_selected" \
-#     --train_script "train_channel_aware_kfold_optimized.py" \
-#     --save_dir "bayesian_search_results" \
+#     --data_root "$DATA_ROOT" \
+#     --train_script "$TRAIN_SCRIPT" \
+#     --save_dir "$SAVE_DIR" \
 #     --n_trials 100 \
 #     --n_folds 5 \
 #     --n_epochs 30
@@ -39,9 +50,9 @@ python bayesian_search.py \
 # 带超时的优化（例如运行24小时）
 # ============================================
 # python bayesian_search.py \
-#     --data_root "/mnt/hd1/dyf/workspace/EEG_SUAT/EEG dataset_SUAT_processed_selected" \
-#     --train_script "train_channel_aware_kfold_optimized.py" \
-#     --save_dir "bayesian_search_results" \
+#     --data_root "$DATA_ROOT" \
+#     --train_script "$TRAIN_SCRIPT" \
+#     --save_dir "$SAVE_DIR" \
 #     --n_trials 1000 \
 #     --timeout 86400 \
 #     --n_folds 5 \
@@ -52,11 +63,10 @@ python bayesian_search.py \
 # 注意：需要设置CUDA_VISIBLE_DEVICES来指定不同的GPU
 # ============================================
 # python bayesian_search.py \
-#     --data_root "/mnt/hd1/dyf/workspace/EEG_SUAT/EEG dataset_SUAT_processed_selected" \
-#     --train_script "train_channel_aware_kfold_optimized.py" \
-#     --save_dir "bayesian_search_results" \
+#     --data_root "$DATA_ROOT" \
+#     --train_script "$TRAIN_SCRIPT" \
+#     --save_dir "$SAVE_DIR" \
 #     --n_trials 100 \
 #     --n_folds 5 \
 #     --n_epochs 30 \
 #     --n_jobs 2
-
