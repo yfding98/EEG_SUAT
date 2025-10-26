@@ -32,7 +32,7 @@ except ImportError:
 class BayesianSearchRunner:
     """贝叶斯优化搜索运行器"""
     
-    def __init__(self, data_root, base_save_dir, train_script_path):
+    def __init__(self, data_root, base_save_dir, train_script_path, script_type='auto'):
         if not OPTUNA_AVAILABLE:
             raise ImportError("需要安装Optuna: pip install optuna")
         
@@ -40,6 +40,7 @@ class BayesianSearchRunner:
         self.base_save_dir = Path(base_save_dir)
         self.base_save_dir.mkdir(parents=True, exist_ok=True)
         self.train_script_path = train_script_path
+        self.script_type = script_type
         
         # 结果保存路径
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -156,23 +157,46 @@ class BayesianSearchRunner:
             
             print(f"训练完成!")
             
-            # 读取训练结果
-            result_files = list(self.results_dir.glob(
-                f"trial_{experiment_id}/channel_aware_kfold_optimized_fixed_*/kfold_results.json"
+            # 读取训练结果 - 支持多种训练脚本的结果格式
+            result_files = []
+            
+            # 尝试查找基础EEG分类器的结果
+            basic_eeg_results = list(self.results_dir.glob(
+                f"trial_{experiment_id}/basic_eeg_*/final_results.json"
             ))
+            if basic_eeg_results:
+                result_files = basic_eeg_results
+            
+            # 尝试查找K折交叉验证的结果
+            if not result_files:
+                kfold_results = list(self.results_dir.glob(
+                    f"trial_{experiment_id}/channel_aware_kfold_*/kfold_results.json"
+                ))
+                if kfold_results:
+                    result_files = kfold_results
             
             if result_files:
                 with open(result_files[0], 'r') as f:
                     training_results = json.load(f)
                 
-                mean_f1 = training_results['mean_f1']
-                std_f1 = training_results['std_f1']
-                
-                print(f"结果: Mean F1={mean_f1:.2f}% ± {std_f1:.2f}%")
+                # 处理不同的结果格式
+                if 'test_metrics' in training_results:
+                    # 基础EEG分类器格式
+                    mean_f1 = training_results['test_metrics']['macro_f1']
+                    print(f"结果: Test F1={mean_f1:.2f}%")
+                elif 'mean_f1' in training_results:
+                    # K折交叉验证格式
+                    mean_f1 = training_results['mean_f1']
+                    std_f1 = training_results.get('std_f1', 0)
+                    print(f"结果: Mean F1={mean_f1:.2f}% ± {std_f1:.2f}%")
+                else:
+                    print("警告: 未知的结果格式")
+                    return 0.0
                 
                 return mean_f1
             else:
                 print("警告: 未找到结果文件")
+                print(f"搜索路径: {self.results_dir}/trial_{experiment_id}/")
                 return 0.0
                 
         except subprocess.CalledProcessError as e:

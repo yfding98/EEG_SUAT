@@ -5,7 +5,7 @@
 # ============================================
 # 配置变量
 # ============================================
-TRAIN_SCRIPT="train_channel_aware_kfold_optimized.py"
+TRAIN_SCRIPT="train_basic_eeg_classifier.py"
 DATA_ROOT="/mnt/hd1/dyf/workspace/EEG_SUAT/EEG dataset_SUAT_processed_selected"
 SAVE_DIR="bayesian_search_results"
 N_TRIALS=50
