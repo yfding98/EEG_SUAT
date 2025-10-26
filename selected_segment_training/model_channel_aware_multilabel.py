@@ -292,7 +292,7 @@ class ChannelAwareMultilabelNet(nn.Module):
         if channel_mask is None:
             channel_mask = torch.ones(batch_size, self.n_channels, device=bands_tensor.device)
 
-        bands_tensor = bands_tensor.permute(1, 0, 2, 3)
+        # bands_tensor = bands_tensor.permute(1, 0, 2, 3)
         # 1. 频段注意力融合
         fused_data, attention_weights = self.band_attention(bands_tensor)  # (batch, n_channels, n_samples)
         
