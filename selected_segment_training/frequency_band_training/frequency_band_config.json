@@ -1,0 +1,115 @@
+{
+  "data_config": {
+    "data_root": "E:\\DataSet\\EEG\\EEG dataset_SUAT_processed_selected",
+    "window_size": 6.0,
+    "window_stride": 3.0,
+    "sampling_rate": 250,
+    "val_split": 0.15,
+    "test_split": 0.15,
+    "seed": 42
+  },
+  "model_config": {
+    "d_model": 128,
+    "n_heads": 8,
+    "n_layers": 2,
+    "dropout": 0.3
+  },
+  "training_config": {
+    "batch_size": 8,
+    "lr": 0.001,
+    "weight_decay": 0.01,
+    "n_epochs": 50,
+    "early_stopping_patience": 20
+  },
+  "loss_config": {
+    "use_focal_loss": true,
+    "use_class_weights": true,
+    "focal_alpha": 1.0,
+    "focal_gamma": 2.0
+  },
+  "frequency_bands": {
+    "delta": {
+      "frequency_range": [0.5, 4.0],
+      "description": "Delta波 - 低频段，深度睡眠相关",
+      "model_params": {
+        "d_model": 128,
+        "n_heads": 8,
+        "n_layers": 2,
+        "dropout": 0.3
+      },
+      "training_params": {
+        "lr": 0.001,
+        "batch_size": 8,
+        "n_epochs": 50
+      }
+    },
+    "theta": {
+      "frequency_range": [4.0, 8.0],
+      "description": "Theta波 - 中低频段，睡眠和冥想相关",
+      "model_params": {
+        "d_model": 128,
+        "n_heads": 8,
+        "n_layers": 2,
+        "dropout": 0.3
+      },
+      "training_params": {
+        "lr": 0.001,
+        "batch_size": 8,
+        "n_epochs": 50
+      }
+    },
+    "alpha": {
+      "frequency_range": [8.0, 13.0],
+      "description": "Alpha波 - 中频段，放松和专注相关",
+      "model_params": {
+        "d_model": 128,
+        "n_heads": 8,
+        "n_layers": 2,
+        "dropout": 0.3
+      },
+      "training_params": {
+        "lr": 0.001,
+        "batch_size": 8,
+        "n_epochs": 50
+      }
+    },
+    "beta": {
+      "frequency_range": [13.0, 30.0],
+      "description": "Beta波 - 中高频段，活跃思维相关",
+      "model_params": {
+        "d_model": 128,
+        "n_heads": 8,
+        "n_layers": 2,
+        "dropout": 0.3
+      },
+      "training_params": {
+        "lr": 0.001,
+        "batch_size": 8,
+        "n_epochs": 50
+      }
+    },
+    "gamma": {
+      "frequency_range": [30.0, 100.0],
+      "description": "Gamma波 - 高频段，高级认知相关",
+      "model_params": {
+        "d_model": 128,
+        "n_heads": 8,
+        "n_layers": 2,
+        "dropout": 0.3
+      },
+      "training_params": {
+        "lr": 0.001,
+        "batch_size": 8,
+        "n_epochs": 50
+      }
+    }
+  },
+  "experiment_config": {
+    "parallel_training": false,
+    "max_workers": 2,
+    "save_dir": "checkpoints_frequency_band",
+    "create_visualizations": true,
+    "aggregate_results": true
+  }
+}
+
