@@ -350,8 +350,23 @@ class BasicEEGTrainer:
         
         # 测试集评估
         print("\n在测试集上评估...")
-        checkpoint = torch.load(self.save_dir / 'best_model.pth', weights_only=False)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        best_model_path = self.save_dir / 'best_model.pth'
+        if best_model_path.exists():
+            print("加载最佳模型进行测试...")
+            checkpoint = torch.load(best_model_path, weights_only=False)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            print("未找到最佳模型，使用当前模型进行测试...")
+            # 尝试加载最后一个checkpoint
+            checkpoint_path = self.save_dir / 'checkpoint.pth'
+            if checkpoint_path.exists():
+                import shutil
+                shutil.copyfile(checkpoint_path, best_model_path)
+                print("已将最后的checkpoint复制为best_model.pth")
+                checkpoint = torch.load(best_model_path, weights_only=False)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                print("警告：未找到任何模型文件，使用当前模型状态")
         
         test_metrics = self.validate(n_epochs, 'Test')
         
@@ -553,7 +568,7 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) == 1:
         sys.argv.extend([
-            '--data_root', r'E:\DataSet\EEG\EEG dataset_SUAT_processed_selected',
+            '--data_root', r'/mnt/hd1/dyf/dataset/EEG dataset_SUAT_processed_selected',
             '--window_size', '6',
             '--window_stride', '3',
             '--batch_size', '8',
